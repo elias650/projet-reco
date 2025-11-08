@@ -23,9 +23,25 @@ DATA_DIR = "data"
 ANON_DIR = os.path.join(DATA_DIR, "anonymes")
 
 def csv_path(name: str) -> str:
-    """Utilise data/anonymes/<name> si le fichier existe, sinon data/<name>."""
-    anon = os.path.join(ANON_DIR, name)
-    return anon if os.path.exists(anon) else os.path.join(DATA_DIR, name)
+    """Cherche le fichier CSV dans data/anonymes/ ou Data/anonymes/."""
+    import os
+    DATA_DIRS = ["data", "Data"]  # accepte les deux
+    ANON_SUB = "anonymes"
+
+    # 1️⃣ Cherche d'abord dans data*/anonymes/
+    for base in DATA_DIRS:
+        anon = os.path.join(base, ANON_SUB, name)
+        if os.path.exists(anon):
+            return anon
+
+    # 2️⃣ Sinon cherche dans data*/ directement
+    for base in DATA_DIRS:
+        p = os.path.join(base, name)
+        if os.path.exists(p):
+            return p
+
+    # 3️⃣ Sinon retourne un chemin par défaut (pour message clair)
+    return os.path.join(DATA_DIRS[0], name)
 
 CSV_INFOS = csv_path("information initiales.csv")
 CSV_J0    = csv_path("Mesures J0.csv")
