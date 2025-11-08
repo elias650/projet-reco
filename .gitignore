@@ -9,7 +9,8 @@ data/*.csv
 !data/anonymes/*.csv
 
 # Caches streamlit
-.streamlit/
+.streamlit/*
+!.streamlit/config.toml
 
 # Autres fichiers temporaires
 __pycache__/

@@ -17,30 +17,27 @@ from sklearn.ensemble import RandomForestRegressor
 # ==========================================================
 # === PARAMETRES (avec anonymes auto si dispo) =============
 # ==========================================================
-import os
-
 DATA_DIR = "data"
 ANON_DIR = os.path.join(DATA_DIR, "anonymes")
 
 def csv_path(name: str) -> str:
     """Cherche le fichier CSV dans data/anonymes/ ou Data/anonymes/."""
-    import os
     DATA_DIRS = ["data", "Data"]  # accepte les deux
     ANON_SUB = "anonymes"
 
-    # 1️⃣ Cherche d'abord dans data*/anonymes/
+    # 1) Cherche d'abord dans data*/anonymes/
     for base in DATA_DIRS:
         anon = os.path.join(base, ANON_SUB, name)
         if os.path.exists(anon):
             return anon
 
-    # 2️⃣ Sinon cherche dans data*/ directement
+    # 2) Sinon cherche dans data*/ directement
     for base in DATA_DIRS:
         p = os.path.join(base, name)
         if os.path.exists(p):
             return p
 
-    # 3️⃣ Sinon retourne un chemin par défaut (pour message clair)
+    # 3) Sinon retourne un chemin par défaut (pour message clair)
     return os.path.join(DATA_DIRS[0], name)
 
 CSV_INFOS = csv_path("information initiales.csv")
@@ -49,8 +46,14 @@ CSV_J6    = csv_path("Mesures J+6 semaines.csv")
 CSV_INT   = csv_path("Interventions.csv")
 
 MUSCLES = ["Ext hanche D","Ext hanche G","Flx genou D","Flx genou G","Ext genou D","Ext genou G"]
-TEST_SUBJECTS = ['Alexia','Romain','Elise']   # sous-ensemble test
-CSV_SORTIE_RECO = "recommandations.csv"       # fichier de sauvegarde des recos
+
+# ⚠️ TEST_SUBJECTS : reconstruit si anonymisés (conserve compatibilité)
+TEST_SUBJECTS_DEFAULT = ['Alexia','Romain','Elise']
+CSV_SORTIE_RECO = "recommandations.csv"
+
+# Hyperparamètres de décision (pour 2 plans) — réglables
+LAMBDA_EQ = 0.35   # poids de l'équilibre pour le Plan Équilibré
+TAU_STD   = 10.0   # déséquilibre max (écart-type en points de %) pour Plan Performance
 
 # ==========================================================
 # === LECTURE CSV (encodage Windows) =======================
@@ -101,11 +104,14 @@ print("Sujets en trop dans Interventions   :", sorted(set_int - set_info))
 # ==========================================================
 # === TEST_SUBJECTS robuste (IDs anonymes) =================
 # ==========================================================
-# On reconstruit automatiquement une liste de test compatible (Sujet1, Sujet2, Sujet3, ...)
-# si les anciens prénoms n'existent plus.
 all_ids = sorted(set(info['Sujets'].astype(str).str.strip()))
-DEFAULT_TEST = [f"Sujet{i}" for i in range(1, 50)]  # large au cas où
-TEST_SUBJECTS = [x for x in DEFAULT_TEST if x in all_ids][:3] or all_ids[:min(3, len(all_ids))]
+DEFAULT_TEST = [f"Sujet{i}" for i in range(1, 50)]
+TEST_SUBJECTS = [x for x in TEST_SUBJECTS_DEFAULT if x in all_ids]
+if len(TEST_SUBJECTS) < 3:
+    fallback = [x for x in DEFAULT_TEST if x in all_ids][:3-len(TEST_SUBJECTS)]
+    TEST_SUBJECTS = TEST_SUBJECTS + fallback
+if not TEST_SUBJECTS:
+    TEST_SUBJECTS = all_ids[:min(3, len(all_ids))]
 print("TEST utilisé :", TEST_SUBJECTS)
 
 # ==========================================================
@@ -248,7 +254,7 @@ patient_row = data.sample(1).iloc[0]
 print({k: patient_row[k] for k in list(data.columns)[:8]}, "...")
 
 def recommander(patient_row):
-    # grille raisonnable (tu peux affiner)
+    """Plan unique (historique) : score = moyenne - std (lambda=1)."""
     rm_values = np.linspace(40, 90, 11)       # 40,45,...,90
     series_values = np.linspace(4, 12, 9)     # 4,5,...,12
     best_score, best_rm, best_series = -1e9, None, None
@@ -257,29 +263,74 @@ def recommander(patient_row):
     for rm in rm_values:
         for s in series_values:
             row = patient_row.copy()
-            # on écrase uniquement les features utiles à l'intervention
             row['%RM_num'] = rm
-            # si le modèle a encodé %RM (catégoriel), on peut garder la valeur en place (%RM) — peu importe ici
             row['Séries/semaine'] = s
 
             x = pd.DataFrame([row[feat_cols]])
-            preds = []
-            for m in MUSCLES:
-                preds.append(MODELS[m].predict(x)[0])
-            preds = np.array(preds)
+            preds = np.array([MODELS[m].predict(x)[0] for m in MUSCLES])
 
-            # Score "équilibré" = moyenne - écart-type (lambda=1)
             score = preds.mean() - preds.std()
             if score > best_score:
                 best_score, best_rm, best_series, best_preds = score, rm, s, preds
 
     return best_rm, best_series, best_preds, best_score
 
-print("\n>>> Début optimisation de l'intervention")
+# === NOUVEAU : deux plans pour décision partagée ==========
+def recommander_deux_plans(patient_row):
+    """Retourne deux propositions :
+       - Plan Équilibré : moyenne - LAMBDA_EQ * std
+       - Plan Performance (contrainte) : max moyenne sous std <= TAU_STD
+    """
+    rm_values = np.linspace(40, 90, 11)
+    series_values = np.linspace(4, 12, 9)
+
+    best_eq   = {'score': -1e9}
+    best_perf = {'score': -1e9}
+
+    for rm in rm_values:
+        for s in series_values:
+            row = patient_row.copy()
+            row['%RM_num'] = rm
+            row['Séries/semaine'] = s
+
+            x = pd.DataFrame([row[feat_cols]])
+            preds = np.array([MODELS[m].predict(x)[0] for m in MUSCLES])
+
+            mean_gain = preds.mean()
+            std_gain  = preds.std()
+
+            # Plan 1 : ÉQUILIBRÉ
+            score_eq = mean_gain - LAMBDA_EQ * std_gain
+            if score_eq > best_eq['score']:
+                best_eq = {'score':score_eq, 'rm':rm, 'ser':s, 'preds':preds, 'mean':mean_gain, 'std':std_gain}
+
+            # Plan 2 : PERFORMANCE sous contrainte
+            if std_gain <= TAU_STD:
+                score_perf = mean_gain
+                if score_perf > best_perf['score']:
+                    best_perf = {'score':score_perf, 'rm':rm, 'ser':s, 'preds':preds, 'mean':mean_gain, 'std':std_gain}
+
+    if best_perf['score'] == -1e9:
+        # aucun plan ne respecte la contrainte : on renvoie un "plan vide"
+        best_perf = {'score': -1e9, 'rm': np.nan, 'ser': np.nan,
+                     'preds': np.array([np.nan]*len(MUSCLES)), 'mean': np.nan, 'std': np.nan}
+    return best_eq, best_perf
+
+def _afficher_plan(titre, plan):
+    print(titre)
+    if np.isnan(plan.get('rm', np.nan)):
+        print("  Aucune combinaison ne respecte la contrainte choisie (τ). Augmente TAU_STD (ex. 12).")
+        return
+    print(f"  %RM: {plan['rm']:.1f} | Séries/sem: {plan['ser']:.1f}")
+    print(f"  Gain moyen: {plan['mean']:.2f}% | Déséquilibre (écart-type): {plan['std']:.2f}")
+    for m, g in zip(MUSCLES, plan['preds']):
+        print(f"    - {m}: {g:.2f}%")
+    print(f"  Score: {plan['score']:.2f}")
+
+print("\n>>> Début optimisation de l'intervention (démo plan unique)")
 opt_rm, opt_ser, opt_preds, opt_score = recommander(patient_row)
 print(">>> Optimisation terminée\n")
-
-print("=== Recommandation OPTIMALE & ÉQUILIBRÉE ===")
+print("=== Recommandation OPTIMALE & ÉQUILIBRÉE (plan unique historique) ===")
 print(f"%RM recommandé : {opt_rm:.1f}")
 print(f"Séries/semaine recommandé : {opt_ser:.1f}")
 print("Gains prédits par muscle (%):")
@@ -288,7 +339,7 @@ for m, g in zip(MUSCLES, opt_preds):
 print(f"Score global (moy - écart-type) : {opt_score:.2f}")
 
 # ==========================================================
-# === INTERFACE CONSOLE POUR SAISIR UN NOUVEAU PATIENT =====
+# === I/O UTILITAIRES ======================================
 # ==========================================================
 def _safe_input(prompt, default=None, dtype=str):
     """Lecture robuste : accepte décimales avec virgule, vide => default."""
@@ -338,7 +389,6 @@ def saisir_patient_depuis_console(df):
     defaults = _default_patient_from_data(df)
     print("\n--- Saisie d'un nouveau patient (laisser vide pour garder la valeur par défaut) ---")
     p = {}
-
     p['Sujets'] = _safe_input(f"Nom du sujet [{defaults['Sujets']}]: ", defaults['Sujets'], str)
     p['âge'] = _safe_input(f"Âge [{defaults['âge']}]: ", defaults['âge'], float)
     p['sexe'] = _safe_input(f"Sexe (H/F) [{defaults['sexe']}]: ", defaults['sexe'], str)
@@ -346,22 +396,16 @@ def saisir_patient_depuis_console(df):
     p['latéralité'] = _safe_input(f"Latéralité (droitier/gaucher) [{defaults['latéralité']}]: ", defaults['latéralité'], str)
     p['niveau'] = _safe_input(f"Niveau (débutant/intermédiaire/avancé) [{defaults['niveau']}]: ", defaults['niveau'], str)
     p['1RM'] = _safe_input(f"1RM (kg) [{defaults['1RM']}]: ", defaults['1RM'], float)
-
     # Mesures J0 (accepte virgules)
     for m in ["Ext hanche D","Ext hanche G","Flx genou D","Flx genou G","Ext genou D","Ext genou G"]:
         col = f"{m}_J0"
         p[col] = _safe_input(f"{col} [{defaults[col]}]: ", defaults[col], float)
-
     # Placeholders (seront écrasés pour la reco)
-    p['%RM'] = '60-75'
-    p['%RM_num'] = 67.5
-    p['Séries/semaine'] = 6.0
-
-    # On convertit en Series pour compat avec recommander(patient_row)
+    p['%RM'] = '60-75'; p['%RM_num'] = 67.5; p['Séries/semaine'] = 6.0
     return pd.Series(p)
 
 def sauvegarder_recommandation(path_csv, sujet, opt_rm, opt_ser, opt_preds, opt_score):
-    """Append (ou crée) un CSV de recommandations ; séparateur ';', décimale ','."""
+    """(Compat historique) Append un CSV de recommandations 1-plan ; séparateur ';', décimale ','."""
     out_row = {
         'Sujet': sujet,
         '%RM_reco': round(float(opt_rm), 1),
@@ -370,10 +414,30 @@ def sauvegarder_recommandation(path_csv, sujet, opt_rm, opt_ser, opt_preds, opt_
     }
     for m, g in zip(MUSCLES, opt_preds):
         out_row[f'Gain_pred_{m}_%'] = round(float(g), 2)
+    df_out = pd.DataFrame([out_row])
+    if os.path.exists(path_csv):
+        df_out.to_csv(path_csv, sep=';', decimal=',', mode='a', header=False, index=False, encoding='latin1')
+    else:
+        df_out.to_csv(path_csv, sep=';', decimal=',', index=False, encoding='latin1')
+
+def sauvegarder_plan(path_csv, sujet, plan, etiquette):
+    """Append (ou crée) un CSV de recommandations 2-plans ; séparateur ';', décimale ','."""
+    if np.isnan(plan.get('rm', np.nan)):
+        return
+    out_row = {
+        'Sujet': sujet,
+        'Type_plan': etiquette,                         # 'Equilibre' ou 'Performance_contrainte'
+        'Intensite_%RM': int(round(float(plan['rm']))), # entier propre
+        'Series_semaine': round(float(plan['ser']), 1),
+        'Gain_moyen_%': round(float(plan['mean']), 2),
+        'Desequilibre_std_pts': round(float(plan['std']), 2),
+        'Score': round(float(plan['score']), 2)
+    }
+    for m, g in zip(MUSCLES, plan['preds']):
+        out_row[f'Gain_pred_{m}_%'] = round(float(g), 2)
 
     df_out = pd.DataFrame([out_row])
     if os.path.exists(path_csv):
-        # append sans doubler l’en-tête
         df_out.to_csv(path_csv, sep=';', decimal=',', mode='a', header=False, index=False, encoding='latin1')
     else:
         df_out.to_csv(path_csv, sep=';', decimal=',', index=False, encoding='latin1')
@@ -383,63 +447,91 @@ def sauvegarder_recommandation(path_csv, sujet, opt_rm, opt_ser, opt_preds, opt_
 # ==========================================================
 if __name__ == "__main__":
     while True:
-        choice = input("\nSouhaites-tu saisir un NOUVEAU patient maintenant ? (o/n) : ").strip().lower()
-        if choice not in ('o', 'oui', 'y'):
+        choice = input("\nSaisir un NOUVEAU patient ? (o=1 plan / 2=deux plans / n=non) : ").strip().lower()
+        if choice not in ('o', 'oui', 'y', '2'):
             print("\nFin du mode interactif. À bientôt !")
             break
 
         patient_new = saisir_patient_depuis_console(data)
-        print("\n>>> Début optimisation de l'intervention (nouveau patient)")
-        opt_rm2, opt_ser2, opt_preds2, opt_score2 = recommander(patient_new)
-        print(">>> Optimisation terminée\n")
 
-        print("=== RECOMMANDATION POUR NOUVEAU PATIENT ===")
-        print(f"Sujet : {patient_new['Sujets']}")
-        print(f"%RM recommandé : {opt_rm2:.1f}")
-        print(f"Séries/semaine recommandé : {opt_ser2:.1f}")
-        print("Gains prédits par muscle (%):")
-        for m, g in zip(MUSCLES, opt_preds2):
-            print(f"  - {m}: {g:.2f}")
-        print(f"Score global (moy - écart-type) : {opt_score2:.2f}")
+        if choice == '2':
+            print("\n>>> Début optimisation (DEUX PLANS)")
+            best_eq, best_perf = recommander_deux_plans(patient_new)
+            print(">>> Optimisation terminée\n")
+            _afficher_plan("=== OPTION 1 — PLAN ÉQUILIBRÉ ===", best_eq)
+            _afficher_plan("=== OPTION 2 — PLAN PERFORMANCE (std ≤ τ) ===", best_perf)
+            # Sauvegarde des deux (si dispo)
+            sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], best_eq, "Equilibre")
+            sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], best_perf, "Performance_contrainte")
+            print(f"✔ Deux propositions enregistrées (si disponibles) dans '{CSV_SORTIE_RECO}'")
+        else:
+            print("\n>>> Début optimisation (PLAN UNIQUE historique)")
+            opt_rm2, opt_ser2, opt_preds2, opt_score2 = recommander(patient_new)
+            print(">>> Optimisation terminée\n")
+            print("=== RECOMMANDATION POUR NOUVEAU PATIENT ===")
+            print(f"Sujet : {patient_new['Sujets']}")
+            print(f"%RM recommandé : {opt_rm2:.1f}")
+            print(f"Séries/semaine recommandé : {opt_ser2:.1f}")
+            print("Gains prédits par muscle (%):")
+            for m, g in zip(MUSCLES, opt_preds2):
+                print(f"  - {m}: {g:.2f}")
+            print(f"Score global (moy - écart-type) : {opt_score2:.2f}")
+            sauvegarder_recommandation(CSV_SORTIE_RECO, patient_new['Sujets'],
+                                       opt_rm2, opt_ser2, opt_preds2, opt_score2)
+            print(f"✔ Recommandation enregistrée automatiquement dans '{CSV_SORTIE_RECO}'")
 
-        sauvegarder_recommandation(CSV_SORTIE_RECO, patient_new['Sujets'],
-                                   opt_rm2, opt_ser2, opt_preds2, opt_score2)
-        print(f"✔ Recommandation enregistrée automatiquement dans '{CSV_SORTIE_RECO}'")
-
-# === API UTILITAIRE POUR L'APP STREAMLIT ======================================
-# Doit être au niveau racine du module (pas dans if __name__ == "__main__")
-
-import pandas as pd  # au cas où
+# === API UTILITAIRES POUR L'APP STREAMLIT =================
+# (Conserve l'API existante + ajoute la variante 2-plans)
 
 def reco_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
                        hip_ext_G, hip_ext_D, knee_flex_G, knee_flex_D, knee_ext_G, knee_ext_D):
     """
-    Construit une ligne 'patient' au format attendu par ton code, puis appelle `recommander`.
-    Retourne: (pct_rm: float, series_sem: float, gains: list[float in MUSCLES order], score: float)
+    API historique (1 plan).
+    Retourne: (pct_rm: float, series_sem: float, gains: list[float], score: float)
     """
     row = {
         'Sujets': 'API_patient',
-        'âge': age,
-        'sexe': sexe,
-        'poids': poids,
-        'latéralité': lateralite,           # 'droitier' / 'gaucher' / 'ambidextre'
-        'niveau': niveau,                   # 'débutant' / 'intermédiaire' / 'avancé'
-        '1RM': one_rm,
-        'Ext hanche G_J0': hip_ext_G,
-        'Ext hanche D_J0': hip_ext_D,
-        'Flx genou G_J0': knee_flex_G,
-        'Flx genou D_J0': knee_flex_D,
-        'Ext genou G_J0': knee_ext_G,
-        'Ext genou D_J0': knee_ext_D,
-        # placeholders intervention – seront écrasés dans la boucle d’optim
-        '%RM': '60-75',
-        '%RM_num': 67.5,
-        'Séries/semaine': 6.0
+        'âge': age, 'sexe': sexe, 'poids': poids,
+        'latéralité': lateralite, 'niveau': niveau, '1RM': one_rm,
+        'Ext hanche G_J0': hip_ext_G, 'Ext hanche D_J0': hip_ext_D,
+        'Flx genou G_J0': knee_flex_G, 'Flx genou D_J0': knee_flex_D,
+        'Ext genou G_J0': knee_ext_G, 'Ext genou D_J0': knee_ext_D,
+        '%RM': '60-75', '%RM_num': 67.5, 'Séries/semaine': 6.0
     }
     s = pd.Series(row)
-
-    # Appel de TA fonction d'optimisation déjà définie dans ce fichier
     opt_rm, opt_ser, opt_preds, opt_score = recommander(s)
-
-    # opt_preds est aligné avec l’ordre MUSCLES de ton script
     return float(opt_rm), float(opt_ser), [float(x) for x in opt_preds], float(opt_score)
+
+def reco2_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
+                        hip_ext_G, hip_ext_D, knee_flex_G, knee_flex_D, knee_ext_G, knee_ext_D):
+    """
+    NOUVELLE API (2 plans).
+    Retourne un dict:
+    {
+      "equilibre": {"rm":..., "series":..., "mean":..., "std":..., "score":..., "gains":[...]},
+      "performance": {...}  # peut contenir des NaN si contrainte non satisfaite
+    }
+    """
+    row = {
+        'Sujets': 'API_patient',
+        'âge': age, 'sexe': sexe, 'poids': poids,
+        'latéralité': lateralite, 'niveau': niveau, '1RM': one_rm,
+        'Ext hanche G_J0': hip_ext_G, 'Ext hanche D_J0': hip_ext_D,
+        'Flx genou G_J0': knee_flex_G, 'Flx genou D_J0': knee_flex_D,
+        'Ext genou G_J0': knee_ext_G, 'Ext genou D_J0': knee_ext_D,
+        '%RM': '60-75', '%RM_num': 67.5, 'Séries/semaine': 6.0
+    }
+    s = pd.Series(row)
+    best_eq, best_perf = recommander_deux_plans(s)
+
+    def _pack(plan):
+        return {
+            "rm": (None if np.isnan(plan.get('rm', np.nan)) else float(plan['rm'])),
+            "series": (None if np.isnan(plan.get('ser', np.nan)) else float(plan['ser'])),
+            "mean": (None if np.isnan(plan.get('mean', np.nan)) else float(plan['mean'])),
+            "std": (None if np.isnan(plan.get('std', np.nan)) else float(plan['std'])),
+            "score": (None if np.isnan(plan.get('score', np.nan)) else float(plan['score'])),
+            "gains": ([] if np.isnan(plan.get('rm', np.nan)) else [float(x) for x in plan['preds']])
+        }
+
+    return {"equilibre": _pack(best_eq), "performance": _pack(best_perf)}
