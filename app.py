@@ -75,14 +75,16 @@ with st.container(border=True):
     one_rm = st.number_input("1RM de référence (kg)", min_value=10.0, max_value=300.0, value=100.0, step=0.5)
 
 with st.container(border=True):
-    st.subheader("Niveaux de force normalisés (0–100, jusqu’à 10 décimales)")
+    st.subheader("Niveaux de force normalisés (0–100, précision 0,001)")
     cL, cR = st.columns(2)
-    hip_ext_G   = cL.number_input("Extenseurs de hanche — Gauche",  min_value=0.0, max_value=100.0, value=55.0, step=0.0000000001, format="%.10f")
-    hip_ext_D   = cR.number_input("Extenseurs de hanche — Droite",  min_value=0.0, max_value=100.0, value=60.0, step=0.0000000001, format="%.10f")
-    knee_flex_G = cL.number_input("Fléchisseurs de genou — Gauche", min_value=0.0, max_value=100.0, value=60.0, step=0.0000000001, format="%.10f")
-    knee_flex_D = cR.number_input("Fléchisseurs de genou — Droite", min_value=0.0, max_value=100.0, value=62.0, step=0.0000000001, format="%.10f")
-    knee_ext_G  = cL.number_input("Extenseurs de genou — Gauche",   min_value=0.0, max_value=100.0, value=52.0, step=0.0000000001, format="%.10f")
-    knee_ext_D  = cR.number_input("Extenseurs de genou — Droite",   min_value=0.0, max_value=100.0, value=58.0, step=0.0000000001, format="%.10f")
+
+    hip_ext_G   = cL.number_input("Extenseurs de hanche — Gauche",  min_value=0.0, max_value=100.0, value=55.0, step=0.001, format="%.3f")
+    hip_ext_D   = cR.number_input("Extenseurs de hanche — Droite",  min_value=0.0, max_value=100.0, value=60.0, step=0.001, format="%.3f")
+    knee_flex_G = cL.number_input("Fléchisseurs de genou — Gauche", min_value=0.0, max_value=100.0, value=60.0, step=0.001, format="%.3f")
+    knee_flex_D = cR.number_input("Fléchisseurs de genou — Droite", min_value=0.0, max_value=100.0, value=62.0, step=0.001, format="%.3f")
+    knee_ext_G  = cL.number_input("Extenseurs de genou — Gauche",   min_value=0.0, max_value=100.0, value=52.0, step=0.001, format="%.3f")
+    knee_ext_D  = cR.number_input("Extenseurs de genou — Droite",   min_value=0.0, max_value=100.0, value=58.0, step=0.001, format="%.3f")
+0.0000000001, format="%.10f")
 
 st.write("")  # petit espace
 
