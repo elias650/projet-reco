@@ -1,0 +1,16 @@
+# Environnement virtuel
+.venv/
+
+# Données originales (non anonymisées)
+data/*.csv
+
+# Autoriser les fichiers anonymisés uniquement
+!data/anonymes/
+!data/anonymes/*.csv
+
+# Caches streamlit
+.streamlit/
+
+# Autres fichiers temporaires
+__pycache__/
+*.pyc
