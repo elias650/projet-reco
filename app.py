@@ -84,7 +84,6 @@ with st.container(border=True):
     knee_flex_D = cR.number_input("Fléchisseurs de genou — Droite", min_value=0.0, max_value=100.0, value=62.0, step=0.001, format="%.3f")
     knee_ext_G  = cL.number_input("Extenseurs de genou — Gauche",   min_value=0.0, max_value=100.0, value=52.0, step=0.001, format="%.3f")
     knee_ext_D  = cR.number_input("Extenseurs de genou — Droite",   min_value=0.0, max_value=100.0, value=58.0, step=0.001, format="%.3f")
-0.0000000001, format="%.10f")
 
 st.write("")  # petit espace
 
