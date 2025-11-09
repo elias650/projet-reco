@@ -41,6 +41,10 @@ TAU_STD_Q        = 0.30
 TAU_STD_MAX      = 12.0
 TAU_STD_MIN      = 8.0
 
+# Divergence minimale optionnelle entre plans (éviter doublons exacts)
+MIN_DELTA_RM       = 5.0
+MIN_DELTA_SERIES   = 1.0
+
 # -------------------- utilitaires --------------------
 def _strip_accents(s: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
@@ -226,16 +230,6 @@ def _predict_gains_from_row(row_dict):
     preds = np.array([MODELS[m].predict(x)[0] for m in MUSCLES])
     return preds, preds.mean(), preds.std()
 
-def _evaluate_grid_for_row(row, rm_values, series_values):
-    out = []
-    for rm in rm_values:
-        for s in series_values:
-            tmp = row.copy()
-            tmp['%RM_num'] = rm; tmp['Séries/semaine'] = s
-            preds, mean_gain, std_gain = _predict_gains_from_row(tmp)
-            out.append((rm, s, mean_gain, std_gain, preds))
-    return out
-
 # -------------------- calibration LAMBDA_EQ --------------------
 LAMBDA_EQ_EFFECTIVE = LAMBDA_EQ
 if LAMBDA_EQ_AUTO:
@@ -244,7 +238,13 @@ if LAMBDA_EQ_AUTO:
     subjects = data[feat_cols + ['Sujets']].dropna().copy()
     subject_grids = []
     for _, row in subjects.iterrows():
-        cands = _evaluate_grid_for_row(row, rm_values, series_values)
+        cands = []
+        for rm in rm_values:
+            for s in series_values:
+                tmp = row.copy()
+                tmp['%RM_num'] = rm; tmp['Séries/semaine'] = s
+                preds, mean_gain, std_gain = _predict_gains_from_row(tmp)
+                cands.append((rm, s, mean_gain, std_gain))
         mean_max = max(c[2] for c in cands) if cands else np.nan
         subject_grids.append({'Sujets': row['Sujets'], 'cands': cands, 'mean_max': mean_max})
 
@@ -278,7 +278,60 @@ if LAMBDA_EQ_AUTO:
 else:
     print(f"\n[INFO] LAMBDA_EQ = {LAMBDA_EQ_EFFECTIVE:.2f}")
 
-# -------------------- plan unique (démo console) --------------------
+# -------------------- trois plans : Équilibre / Performance / Stabilité --------------------
+def _different_enough(p1, p2):
+    if p1 is None or p2 is None: return True
+    return (abs(p1['rm']-p2['rm']) >= MIN_DELTA_RM) or (abs(p1['ser']-p2['ser']) >= MIN_DELTA_SERIES)
+
+def recommander_trois_plans(patient_row):
+    rm_all     = np.linspace(40, 90, 11)
+    series_all = np.linspace(4, 12, 9)
+
+    grid = []
+    for rm in rm_all:
+        for s in series_all:
+            row = patient_row.copy()
+            row['%RM_num'] = rm
+            row['Séries/semaine'] = s
+            preds, mean_gain, std_gain = _predict_gains_from_row(row)
+            grid.append({'rm':rm,'ser':s,'preds':preds,'mean':mean_gain,'std':std_gain,
+                         'score_eq': mean_gain - LAMBDA_EQ_EFFECTIVE * std_gain})
+
+    # Option 1: Équilibre
+    opt_eq = max(grid, key=lambda g: g['score_eq'])
+
+    # Option 2: Performance (max mean), essayer de différencier des paramètres
+    grid_sorted_mean = sorted(grid, key=lambda g: g['mean'], reverse=True)
+    opt_perf = None
+    for g in grid_sorted_mean:
+        if _different_enough(opt_eq, g):
+            opt_perf = g; break
+    if opt_perf is None:
+        opt_perf = grid_sorted_mean[0]
+
+    # Option 3: Stabilité (min std), départage par mean décroissant
+    grid_sorted_std = sorted(grid, key=lambda g: (g['std'], -g['mean']))
+    opt_stab = None
+    for g in grid_sorted_std:
+        if _different_enough(opt_eq, g) and _different_enough(opt_perf, g):
+            opt_stab = g; break
+    if opt_stab is None:
+        opt_stab = grid_sorted_std[0]
+
+    for p in (opt_eq, opt_perf, opt_stab):
+        p['score'] = p['score_eq']  # affichage homogène du "score" (seule Option1 l'utilise réellement)
+    return opt_eq, opt_perf, opt_stab
+
+def _afficher_plan(titre, plan):
+    print(titre)
+    if plan is None or (isinstance(plan.get('rm', np.nan), float) and np.isnan(plan['rm'])):
+        print("  Aucun plan disponible."); return
+    print(f"  %RM: {plan['rm']:.1f} | Séries/sem: {plan['ser']:.1f}")
+    print(f"  Gain moyen: {plan['mean']:.2f}% | Déséquilibre (écart-type): {plan['std']:.2f}")
+    for m, g in zip(MUSCLES, plan['preds']): print(f"    - {m}: {g:.2f}%")
+    print(f"  Score (mean - λ·std): {plan['score']:.2f}")
+
+# -------------------- démo plan unique --------------------
 print("\n>>> Patient utilisé pour la recommandation : (échantillon aléatoire)")
 patient_row = data.sample(1).iloc[0]
 print({k: patient_row[k] for k in list(data.columns)[:8]}, "...")
@@ -294,92 +347,6 @@ def recommander(patient_row):
             if score > best['score']:
                 best = {'score':score,'rm':rm,'ser':s,'preds':preds,'mean':mean_gain,'std':std_gain}
     return best['rm'], best['ser'], best['preds'], best['score']
-
-# -------------------- deux plans : Équilibre vs Ciblage faiblesse --------------------
-def _weakness_weights_for_patient(patient_row, cohort_means, min_total_deficit=0.30):
-    # déficit relatif vs moyenne de cohorte : max(0, (mu - J0)/mu)
-    j0_vec = np.array([patient_row[f"{m}_J0"] for m in MUSCLES], dtype=float)
-    mu_vec = np.array([cohort_means[m]          for m in MUSCLES], dtype=float)
-    eps = 1e-9
-    rel_def = np.maximum(0.0, (mu_vec - j0_vec) / np.maximum(mu_vec, eps))  # 0 si patient ≥ moyenne
-    total_def = float(rel_def.sum())
-
-    if total_def >= min_total_deficit:
-        w = rel_def / total_def
-        scheme = "deficit_relatif"
-    else:
-        # fallback : priorité aux 2 plus faibles valeurs J0 du patient (rank-based)
-        ranks = np.argsort(j0_vec)  # 0 = plus faible
-        w = np.array([0.35, 0.25, 0.15, 0.10, 0.08, 0.07], dtype=float)  # somme = 1
-        w_full = np.zeros(6, dtype=float)
-        for k, idx in enumerate(ranks):
-            w_full[idx] = w[k]
-        w = w_full
-        scheme = "rank_based"
-    return w, scheme, j0_vec, mu_vec, rel_def
-
-def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    an = np.linalg.norm(a); bn = np.linalg.norm(b)
-    if an == 0 or bn == 0: return 1.0
-    return float(np.clip(np.dot(a,b) / (an*bn), -1.0, 1.0))
-
-def recommander_deux_plans(patient_row):
-    rm_all     = np.linspace(40, 90, 11)
-    series_all = np.linspace(4, 12, 9)
-
-    # Option 1 : ÉQUILIBRÉ (moyenne - lambda*std)
-    best_eq = {'score': -1e9}
-    for rm in rm_all:
-        for s in series_all:
-            row = patient_row.copy()
-            row['%RM_num'] = rm
-            row['Séries/semaine'] = s
-            preds, mean_gain, std_gain = _predict_gains_from_row(row)
-            score_eq = mean_gain - LAMBDA_EQ_EFFECTIVE * std_gain
-            if score_eq > best_eq['score']:
-                best_eq = {'score':score_eq,'rm':rm,'ser':s,'preds':preds,'mean':mean_gain,'std':std_gain}
-
-    # Option 2 : CIBLAGE FAIBLESSE (moyenne pondérée par faiblesse)
-    cohort_means = {m: float(data[f"{m}_J0"].mean()) for m in MUSCLES}
-    w, scheme, j0_vec, mu_vec, rel_def = _weakness_weights_for_patient(patient_row, cohort_means)
-
-    best_weak = {'score': -1e9, 'note': f'Weakness_{scheme}'}
-    for rm in rm_all:
-        for s in series_all:
-            row = patient_row.copy()
-            row['%RM_num'] = rm
-            row['Séries/semaine'] = s
-            preds, mean_gain, std_gain = _predict_gains_from_row(row)
-            weighted = float(np.dot(w, preds))  # objectif : gains sur muscles faibles
-            if weighted > best_weak['score']:
-                best_weak = {'score': weighted, 'rm': rm, 'ser': s,
-                             'preds': preds, 'mean': mean_gain, 'std': std_gain,
-                             'note': f'Weakness_{scheme}', 'weights': w}
-
-    return best_eq, best_weak
-
-def _afficher_plan(titre, plan, show_weights=False):
-    print(titre)
-    if plan is None or (isinstance(plan.get('rm', np.nan), float) and np.isnan(plan['rm'])):
-        print("  Aucun plan disponible."); return
-    print(f"  %RM: {plan['rm']:.1f} | Séries/sem: {plan['ser']:.1f}")
-    print(f"  Gain moyen: {plan['mean']:.2f}% | Déséquilibre (écart-type): {plan['std']:.2f}")
-    for m, g in zip(MUSCLES, plan['preds']): print(f"    - {m}: {g:.2f}%")
-    print(f"  Score: {plan['score']:.2f}")
-    if show_weights and 'weights' in plan:
-        print("  Poids faiblesse (somme=1):")
-        for m, w in zip(MUSCLES, plan['weights']):
-            print(f"    - {m}: {w:.2f}")
-
-# -------------------- démo plan unique --------------------
-print("\n>>> Patient utilisé pour la recommandation (démo plan unique)")
-opt_rm, opt_ser, opt_preds, opt_score = recommander(patient_row)
-print("=== Recommandation OPTIMALE & ÉQUILIBRÉE (plan unique) ===")
-print(f"%RM recommandé : {opt_rm:.1f}")
-print(f"Séries/semaine recommandé : {opt_ser:.1f}")
-print("Gains prédits (%):")
-for m, g in zip(MUSCLES, opt_preds): print(f"  - {m}: {g:.2f}")
-print(f"Score global (moy - écart-type) : {opt_score:.2f}")
 
 # -------------------- I/O console & CSV --------------------
 def _safe_input(prompt, default=None, dtype=str):
@@ -430,10 +397,8 @@ def saisir_patient_depuis_console(df):
     p['%RM'] = '60-75'; p['%RM_num'] = 67.5; p['Séries/semaine'] = 6.0
     return pd.Series(p)
 
-def sauvegarder_recommandation(path_csv, sujet, opt_rm, opt_ser, opt_preds, opt_score):
-    out_row = {'Sujet': sujet,'%RM_reco': round(float(opt_rm), 1),'Series_semaine_reco': round(float(opt_ser), 1),'Score_equilibre': round(float(opt_score), 2)}
-    for m, g in zip(MUSCLES, opt_preds): out_row[f'Gain_pred_{m}_%'] = round(float(g), 2)
-    df_out = pd.DataFrame([out_row])
+def _save_row(path_csv, row_dict):
+    df_out = pd.DataFrame([row_dict])
     if os.path.exists(path_csv):
         df_out.to_csv(path_csv, sep=';', decimal=',', mode='a', header=False, index=False, encoding='latin1')
     else:
@@ -441,23 +406,24 @@ def sauvegarder_recommandation(path_csv, sujet, opt_rm, opt_ser, opt_preds, opt_
 
 def sauvegarder_plan(path_csv, sujet, plan, etiquette):
     if plan is None or (isinstance(plan.get('rm', np.nan), float) and np.isnan(plan['rm'])): return
-    out_row = {'Sujet': sujet,'Type_plan': etiquette,'Intensite_%RM': int(round(float(plan['rm']))),
-               'Series_semaine': round(float(plan['ser']), 1),'Gain_moyen_%': round(float(plan['mean']), 2),
-               'Desequilibre_std_pts': round(float(plan['std']), 2),'Score': round(float(plan['score']), 2)}
-    for m, g in zip(MUSCLES, plan['preds']): out_row[f'Gain_pred_{m}_%'] = round(float(g), 2)
-    if 'weights' in plan:
-        for m, w in zip(MUSCLES, plan['weights']):
-            out_row[f'Poids_faiblesse_{m}'] = round(float(w), 3)
-    df_out = pd.DataFrame([out_row])
-    if os.path.exists(path_csv):
-        df_out.to_csv(path_csv, sep=';', decimal=',', mode='a', header=False, index=False, encoding='latin1')
-    else:
-        df_out.to_csv(path_csv, sep=';', decimal=',', index=False, encoding='latin1')
+    out_row = {
+        'Sujet': sujet,
+        'Type_plan': etiquette,
+        'Intensite_%RM': int(round(float(plan['rm']))),
+        'Series_semaine': round(float(plan['ser']), 1),
+        'Gain_moyen_%': round(float(plan['mean']), 2),
+        'Desequilibre_std_pts': round(float(plan['std']), 2),
+        'Score_mean_minus_lambda_std': round(float(plan['score']), 2)
+    }
+    for m, g in zip(MUSCLES, plan['preds']):
+        out_row[f'Gain_pred_{m}_%'] = round(float(g), 2)
+    _save_row(path_csv, out_row)
 
 # -------------------- mode interactif --------------------
 if __name__ == "__main__":
+    # Démo unique
     print("\n>>> Patient utilisé pour la recommandation (démo plan unique)")
-    opt_rm, opt_ser, opt_preds, opt_score = recommander(patient_row)
+    opt_rm, opt_ser, opt_preds, opt_score = recommander(data.sample(1).iloc[0])
     print("=== Recommandation OPTIMALE & ÉQUILIBRÉE (plan unique) ===")
     print(f"%RM recommandé : {opt_rm:.1f}")
     print(f"Séries/semaine recommandé : {opt_ser:.1f}")
@@ -466,21 +432,23 @@ if __name__ == "__main__":
     print(f"Score global (moy - écart-type) : {opt_score:.2f}")
 
     while True:
-        choice = input("\nSaisir un NOUVEAU patient ? (o=1 plan / 2=deux plans / n=non) : ").strip().lower()
-        if choice not in ('o', 'oui', 'y', '2'):
+        choice = input("\nSaisir un NOUVEAU patient ? (1=plan équil. / 3=trois plans / n=non) : ").strip().lower()
+        if choice not in ('1','3','o','oui','y'):
             print("\nFin du mode interactif. À bientôt !"); break
         patient_new = saisir_patient_depuis_console(data)
-        if choice == '2':
-            print("\n>>> Début optimisation (DEUX PLANS)")
-            best_eq, best_weak = recommander_deux_plans(patient_new)
+        if choice == '3':
+            print("\n>>> Début optimisation (TROIS PLANS)")
+            plan_eq, plan_perf, plan_stab = recommander_trois_plans(patient_new)
             print(">>> Optimisation terminée\n")
-            _afficher_plan("=== OPTION 1 — ÉQUILIBRE ===", best_eq)
-            _afficher_plan("=== OPTION 2 — CIBLAGE FAIBLESSE ===", best_weak, show_weights=True)
-            sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], best_eq, "Equilibre")
-            sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], best_weak, "Ciblage_faiblesse")
-            print(f"✔ Deux propositions enregistrées dans '{CSV_SORTIE_RECO}'")
+            _afficher_plan("=== OPTION 1 — ÉQUILIBRE (mean - λ·std) ===", plan_eq)
+            _afficher_plan("=== OPTION 2 — PERFORMANCE (mean max) ===", plan_perf)
+            _afficher_plan("=== OPTION 3 — STABILITÉ (std min) ===", plan_stab)
+            sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], plan_eq,   "Equilibre")
+            sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], plan_perf, "Performance_maxMean")
+            sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], plan_stab, "Stabilite_minStd")
+            print(f"✔ Trois propositions enregistrées dans '{CSV_SORTIE_RECO}'")
         else:
-            print("\n>>> Début optimisation (PLAN UNIQUE)")
+            print("\n>>> Début optimisation (PLAN UNIQUE ÉQUILIBRE)")
             opt_rm2, opt_ser2, opt_preds2, opt_score2 = recommander(patient_new)
             print(">>> Optimisation terminée\n")
             print("=== RECOMMANDATION POUR NOUVEAU PATIENT ===")
@@ -490,8 +458,10 @@ if __name__ == "__main__":
             print("Gains prédits (%):")
             for m, g in zip(MUSCLES, opt_preds2): print(f"  - {m}: {g:.2f}")
             print(f"Score global (moy - écart-type) : {opt_score2:.2f}")
-            sauvegarder_recommandation(CSV_SORTIE_RECO, patient_new['Sujets'], opt_rm2, opt_ser2, opt_preds2, opt_score2)
-            print(f"✔ Recommandation enregistrée dans '{CSV_SORTIE_RECO}'")
+            sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'],
+                             {'rm':opt_rm2,'ser':opt_ser2,'preds':np.array(opt_preds2),
+                              'mean':np.mean(opt_preds2),'std':np.std(opt_preds2),'score':opt_score2},
+                             "Equilibre")
 
 # -------------------- API Streamlit --------------------
 def reco_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
@@ -503,10 +473,10 @@ def reco_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
            'Ext genou G_J0': knee_ext_G,'Ext genou D_J0': knee_ext_D,
            '%RM': '60-75','%RM_num': 67.5,'Séries/semaine': 6.0}
     s = pd.Series(row)
-    opt_rm, opt_ser, opt_preds, opt_score = recommander(s)
-    return float(opt_rm), float(opt_ser), [float(x) for x in opt_preds], float(opt_score)
+    rm, ser, preds, score = recommander(s)
+    return float(rm), float(ser), [float(x) for x in preds], float(score)
 
-def reco2_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
+def reco3_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
                         hip_ext_G, hip_ext_D, knee_flex_G, knee_flex_D, knee_ext_G, knee_ext_D):
     row = {'Sujets': 'API_patient','âge': age,'sexe': sexe,'poids': poids,
            'latéralité': lateralite,'niveau': canon_niveau_keep_tres_avance(niveau),'1RM': one_rm,
@@ -515,16 +485,14 @@ def reco2_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
            'Ext genou G_J0': knee_ext_G,'Ext genou D_J0': knee_ext_D,
            '%RM': '60-75','%RM_num': 67.5,'Séries/semaine': 6.0}
     s = pd.Series(row)
-    best_eq, best_weak = recommander_deux_plans(s)
-    def _pack(plan):
-        if plan is None: return {"rm": None,"series": None,"mean": None,"std": None,"score": None,"gains": [], "weights": []}
+    plan_eq, plan_perf, plan_stab = recommander_trois_plans(s)
+    def _pack(p):
         return {
-            "rm": (None if isinstance(plan.get('rm', np.nan), float) and np.isnan(plan.get('rm', np.nan)) else float(plan['rm'])),
-            "series": (None if isinstance(plan.get('ser', np.nan), float) and np.isnan(plan.get('ser', np.nan)) else float(plan['ser'])),
-            "mean": (None if isinstance(plan.get('mean', np.nan), float) and np.isnan(plan.get('mean', np.nan)) else float(plan['mean'])),
-            "std": (None if isinstance(plan.get('std', np.nan), float) and np.isnan(plan.get('std', np.nan)) else float(plan['std'])),
-            "score": (None if isinstance(plan.get('score', np.nan), float) and np.isnan(plan.get('score', np.nan)) else float(plan['score'])),
-            "gains": ([] if (isinstance(plan.get('rm', np.nan), float) and np.isnan(plan.get('rm', np.nan))) else [float(x) for x in plan['preds']]),
-            "weights": ([] if 'weights' not in plan else [float(x) for x in plan['weights']])
+            "rm": float(p['rm']),
+            "series": float(p['ser']),
+            "mean": float(p['mean']),
+            "std": float(p['std']),
+            "score": float(p['score']),
+            "gains": [float(x) for x in p['preds']]
         }
-    return {"equilibre": _pack(best_eq), "ciblage_faiblesse": _pack(best_weak)}
+    return {"equilibre": _pack(plan_eq), "performance": _pack(plan_perf), "stabilite": _pack(plan_stab)}
