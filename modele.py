@@ -64,7 +64,7 @@ TAU_STD_DYNAMIC = True     # calibration automatique de τ
 TAU_STD_Q   = 0.40         # quantile des std des sujets performants (40e percentile)
 TAU_STD_MAX = 14.0         # borne haute de τ
 TAU_STD_MIN = 8.0          # borne basse de τ
-# --- Diversité entre les deux plans ---
+# --- Diversité entre les deux plans (ON NE L'APPREND PAS) ---
 DIVERGENCE_MIN = 1.0       # distance min entre plans (|Δ%RM| + |Δseries|)
 # Poids du plan équilibré (utilisé dans recommander_deux_plans)
 LAMBDA_EQ_EFFECTIVE = LAMBDA_EQ  # sera mis à jour si calibration auto
@@ -349,11 +349,9 @@ if LAMBDA_EQ_AUTO:
             if mean_ok and std_ok:
                 ok += 1
             else:
-                # garder le niveau de violation (pour fallback)
                 viol_std.append(max(0.0, best[3] - TAU_STD))
                 viol_perf.append(max(0.0, (ALPHA_PERF * sg['mean_max']) - best[2]))
         cov = ok / total if total > 0 else 0.0
-        # score de violation moyen (pour discriminer les lambda si aucune n'atteint la couverture cible)
         v_std  = np.mean(viol_std)  if viol_std  else 0.0
         v_perf = np.mean(viol_perf) if viol_perf else 0.0
         return cov, v_std, v_perf
@@ -368,7 +366,6 @@ if LAMBDA_EQ_AUTO:
         if cov >= COVERAGE_TARGET:
             best_lambda = lmbd
             break
-        # sinon, garder la lambda qui minimise les violations (std en premier, puis perf)
         if (vstd, vperf) < best_viol:
             best_viol = (vstd, vperf)
             best_lambda_if_fail = lmbd
@@ -380,6 +377,170 @@ if LAMBDA_EQ_AUTO:
 else:
     LAMBDA_EQ_EFFECTIVE = LAMBDA_EQ
     print(f"\n[INFO] LAMBDA_EQ fixé manuellement = {LAMBDA_EQ_EFFECTIVE:.2f}")
+
+# ==========================================================
+# === CALIBRATION DUALE (ACCORD AVEC INTERVENTIONS) ========
+# ==========================================================
+def _plan_eq_perf_with_params(row, lambda_eq, tau_std, alpha_perf, div_min=1.0):
+    """Renvoie (best_eq, best_pf) pour un patient donné et un triple d'hyperparams."""
+    rm_values = np.linspace(40, 90, 11)
+    series_values = np.linspace(4, 12, 9)
+
+    # 1) plan équilibré
+    best_eq = {'score': -1e9}
+    for rm in rm_values:
+        for s in series_values:
+            tmp = row.copy()
+            tmp['%RM_num'] = rm
+            tmp['Séries/semaine'] = s
+            preds, mean_gain, std_gain = _predict_gains_from_row(tmp)
+            score_eq = mean_gain - lambda_eq * std_gain
+            if score_eq > best_eq['score']:
+                best_eq = {'score':score_eq, 'rm':rm, 'ser':s,
+                           'preds':preds, 'mean':mean_gain, 'std':std_gain}
+
+    # 2) plan performance (contrainte + diversité fixe)
+    def _dist(p, rm, s):
+        return abs(rm - p['rm']) + abs(s - p['ser'])
+
+    best_pf = {'score': -1e9}
+    candidates = []
+    for rm in rm_values:
+        for s in series_values:
+            tmp = row.copy()
+            tmp['%RM_num'] = rm
+            tmp['Séries/semaine'] = s
+            preds, mean_gain, std_gain = _predict_gains_from_row(tmp)
+            candidates.append((mean_gain, std_gain, rm, s, preds))
+            if (std_gain <= tau_std) and (_dist(best_eq, rm, s) >= div_min):
+                if mean_gain > best_pf['score']:
+                    best_pf = {'score':mean_gain, 'rm':rm, 'ser':s,
+                               'preds':preds, 'mean':mean_gain, 'std':std_gain}
+
+    # 3) fallback fondé sur alpha_perf (pas de seuil arbitraire p75)
+    if best_pf['score'] == -1e9:
+        if candidates:
+            means = np.array([c[0] for c in candidates])
+            pth = alpha_perf * float(np.max(means))
+            pool = [c for c in candidates if c[0] >= pth] or candidates
+            pool.sort(key=lambda z: (z[1], -z[0]))  # std ↑ puis mean ↓
+            for mean_gain, std_gain, rm, s, preds in pool:
+                if _dist(best_eq, rm, s) >= div_min:
+                    best_pf = {'score':mean_gain, 'rm':rm, 'ser':s,
+                               'preds':preds, 'mean':mean_gain, 'std':std_gain}
+                    break
+            if best_pf['score'] == -1e9:
+                mean_gain, std_gain, rm, s, preds = pool[0]
+                best_pf = {'score':mean_gain, 'rm':rm, 'ser':s,
+                           'preds':preds, 'mean':mean_gain, 'std':std_gain}
+        else:
+            best_pf = {'score': -1e9, 'rm': np.nan, 'ser': np.nan,
+                       'preds': np.array([np.nan]*len(MUSCLES)), 'mean': np.nan, 'std': np.nan}
+
+    return best_eq, best_pf
+
+def _dist_plan_interv(plan, rm_real, s_real):
+    if plan is None or (isinstance(plan.get('rm', np.nan), float) and np.isnan(plan['rm'])):
+        return np.inf
+    return abs(float(plan['rm']) - float(rm_real)) + abs(float(plan['ser']) - float(s_real))
+
+def calibrate_dual_params(data, subjects_df, lambda_grid, tau_grid, alpha_grid, div_min=1.0):
+    """
+    data: table fusionnée complète
+    subjects_df: lignes avec features + 'Sujets' + colonnes d'intervention réelles ('%RM_num', 'Séries/semaine')
+    Retourne (lambda*, tau*, alpha*, accord, stats)
+    """
+    best = None
+    stats = []
+    for lam in lambda_grid:
+        for tau in tau_grid:
+            for alp in alpha_grid:
+                agree = 0; total = 0
+                std_viol = []
+                for _, row in subjects_df.iterrows():
+                    if not np.isfinite(row.get('%RM_num', np.nan)) or not np.isfinite(row.get('Séries/semaine', np.nan)):
+                        continue
+                    eq, pf = _plan_eq_perf_with_params(row, lam, tau, alp, div_min=div_min)
+                    # lequel est le plus proche de l'intervention réelle ?
+                    d_eq = _dist_plan_interv(eq, row['%RM_num'], row['Séries/semaine'])
+                    d_pf = _dist_plan_interv(pf, row['%RM_num'], row['Séries/semaine'])
+                    if np.isfinite(d_eq) or np.isfinite(d_pf):
+                        total += 1
+                        # accord = "l'une des deux propositions colle le mieux" (peu importe laquelle)
+                        if d_eq < d_pf:
+                            agree += 1
+                        elif d_pf < d_eq:
+                            agree += 1
+                        else:
+                            agree += 0.5
+                        # Violation std pour PF (informationnelle)
+                        if pf and np.isfinite(pf.get('std', np.nan)):
+                            std_viol.append(max(0.0, float(pf['std']) - tau))
+                acc = agree / total if total > 0 else 0.0
+                v_std = float(np.mean(std_viol)) if std_viol else 0.0
+                stats.append({'lambda': lam, 'tau': tau, 'alpha': alp, 'accord': acc, 'viol_std': v_std, 'n': total})
+                key = (acc, -v_std)  # max accord, puis min violation std
+                if (best is None) or (key > best[0]):
+                    best = (key, (lam, tau, alp, acc, v_std, total))
+    if best is None:
+        return None, pd.DataFrame(stats)
+    (lam, tau, alp, acc, vstd, n) = best[1]
+    return {'lambda': lam, 'tau': tau, 'alpha': alp, 'accord': acc, 'n': n, 'viol_std': vstd}, pd.DataFrame(stats)
+
+# --- Calibration duale globale ---
+print("\n[INFO] Calibration duale (accord avec interventions réelles)")
+subjects_for_dual = data[feat_cols + ['Sujets', '%RM_num', 'Séries/semaine']].dropna().copy()
+
+TAU_GRID = np.linspace(TAU_STD_MIN, TAU_STD_MAX, 7)  # ex. 8.0, 9.0, ..., 14.0
+ALPHA_GRID = np.linspace(0.80, 0.95, 4)              # exigence de performance relative (data-driven)
+dual_best, dual_stats = calibrate_dual_params(
+    data, subjects_for_dual,
+    lambda_grid=LAMBDA_GRID,
+    tau_grid=TAU_GRID,
+    alpha_grid=ALPHA_GRID,
+    div_min=DIVERGENCE_MIN
+)
+if dual_best:
+    LAMBDA_EQ_EFFECTIVE = float(dual_best['lambda'])
+    TAU_STD = float(dual_best['tau'])
+    ALPHA_PERF = float(dual_best['alpha'])
+    print(f"[OK] Hyperparams appris (globaux): lambda={LAMBDA_EQ_EFFECTIVE:.2f} | tau={TAU_STD:.1f} | alpha={ALPHA_PERF:.2f} "
+          f"(accord={dual_best['accord']*100:.1f}% sur n={dual_best['n']})")
+else:
+    print("[INFO] Calibration duale: insuffisante pour améliorer les réglages actuels.")
+
+# ==========================================================
+# === HYPERPARAMS PAR NIVEAU (data-driven) =================
+# ==========================================================
+PARAMS_PAR_NIVEAU = {}
+
+if 'niveau' in data.columns:
+    niveaux_uniques = sorted(data['niveau'].dropna().unique().tolist())
+    for niv in niveaux_uniques:
+        df_niv = data.loc[data['niveau'] == niv, :]
+        subj_niv = df_niv[feat_cols + ['Sujets', '%RM_num', 'Séries/semaine']].dropna().copy()
+        if len(subj_niv) < 5:
+            continue
+        dual_best_niv, _ = calibrate_dual_params(
+            data, subj_niv,
+            lambda_grid=LAMBDA_GRID,
+            tau_grid=np.linspace(TAU_STD_MIN, TAU_STD_MAX, 7),
+            alpha_grid=np.linspace(0.80, 0.95, 4),
+            div_min=DIVERGENCE_MIN
+        )
+        if dual_best_niv:
+            PARAMS_PAR_NIVEAU[niv] = {
+                'lambda': float(dual_best_niv['lambda']),
+                'tau': float(dual_best_niv['tau']),
+                'alpha': float(dual_best_niv['alpha'])
+            }
+
+def _params_for_patient(niveau_norm):
+    if niveau_norm in PARAMS_PAR_NIVEAU:
+        p = PARAMS_PAR_NIVEAU[niveau_norm]
+        return p['lambda'], p['tau'], p['alpha']
+    # fallback global
+    return LAMBDA_EQ_EFFECTIVE, TAU_STD, ALPHA_PERF
 
 # ==========================================================
 # === RECOMMANDATIONS : 1 plan + 2 plans ===================
@@ -406,65 +567,12 @@ def recommander(patient_row):
     return best_rm, best_series, best_preds, best_score
 
 def recommander_deux_plans(patient_row):
-    """Deux propositions :
-       - Équilibré : maximise mean - LAMBDA_EQ_EFFECTIVE * std
-       - Performance : maximise mean sous std <= TAU_STD (calibré) et différent du plan équilibré
-         Fallback : std minimal parmi les combinaisons très performantes (>= p75 des moyennes)
-    """
-    rm_values = np.linspace(40, 90, 11)
-    series_values = np.linspace(4, 12, 9)
-
-    # 1) Plan équilibré
-    best_eq = {'score': -1e9}
-    for rm in rm_values:
-        for s in series_values:
-            row = patient_row.copy()
-            row['%RM_num'] = rm
-            row['Séries/semaine'] = s
-            preds, mean_gain, std_gain = _predict_gains_from_row(row)
-            score_eq = mean_gain - LAMBDA_EQ_EFFECTIVE * std_gain
-            if score_eq > best_eq['score']:
-                best_eq = {'score':score_eq, 'rm':rm, 'ser':s,
-                           'preds':preds, 'mean':mean_gain, 'std':std_gain}
-
-    # 2) Plan performance (contrainte + diversité)
-    def _dist(p, rm, s):
-        return abs(rm - p['rm']) + abs(s - p['ser'])
-
-    best_perf = {'score': -1e9}
-    CANDIDATES = []
-    for rm in rm_values:
-        for s in series_values:
-            row = patient_row.copy()
-            row['%RM_num'] = rm
-            row['Séries/semaine'] = s
-            preds, mean_gain, std_gain = _predict_gains_from_row(row)
-            CANDIDATES.append((mean_gain, std_gain, rm, s, preds))
-            if std_gain <= TAU_STD and _dist(best_eq, rm, s) >= DIVERGENCE_MIN:
-                if mean_gain > best_perf['score']:
-                    best_perf = {'score':mean_gain, 'rm':rm, 'ser':s,
-                                 'preds':preds, 'mean':mean_gain, 'std':std_gain}
-
-    # 3) Fallback si rien ne passe
-    if best_perf['score'] == -1e9:
-        if CANDIDATES:
-            means = np.array([c[0] for c in CANDIDATES])
-            p75 = np.percentile(means, 75)
-            pool = [c for c in CANDIDATES if c[0] >= p75] or CANDIDATES
-            pool.sort(key=lambda z: (z[1], -z[0]))  # std ↑ puis mean ↓
-            for mean_gain, std_gain, rm, s, preds in pool:
-                if _dist(best_eq, rm, s) >= DIVERGENCE_MIN:
-                    best_perf = {'score':mean_gain, 'rm':rm, 'ser':s,
-                                 'preds':preds, 'mean':mean_gain, 'std':std_gain}
-                    break
-            if best_perf['score'] == -1e9:
-                mean_gain, std_gain, rm, s, preds = pool[0]
-                best_perf = {'score':mean_gain, 'rm':rm, 'ser':s,
-                             'preds':preds, 'mean':mean_gain, 'std':std_gain}
-        else:
-            best_perf = {'score': -1e9, 'rm': np.nan, 'ser': np.nan,
-                         'preds': np.array([np.nan]*len(MUSCLES)), 'mean': np.nan, 'std': np.nan}
-
+    """Deux propositions avec hyperparams appris (par niveau si dispo, sinon globaux)."""
+    # récupérer niveau normalisé si présent
+    niv_norm = patient_row.get('niveau', 'intermédiaire')
+    niv_norm = canon_niveau_keep_tres_avance(niv_norm)
+    lam_niv, tau_niv, alp_niv = _params_for_patient(niv_norm)
+    best_eq, best_perf = _plan_eq_perf_with_params(patient_row, lam_niv, tau_niv, alp_niv, div_min=DIVERGENCE_MIN)
     return best_eq, best_perf
 
 def _afficher_plan(titre, plan):
@@ -646,7 +754,10 @@ def reco2_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
         '%RM': '60-75', '%RM_num': 67.5, 'Séries/semaine': 6.0
     }
     s = pd.Series(row)
-    best_eq, best_perf = recommander_deux_plans(s)
+    # récupère hyperparams appris par niveau si dispo
+    niv_norm = canon_niveau_keep_tres_avance(niveau)
+    lam_niv, tau_niv, alp_niv = _params_for_patient(niv_norm)
+    best_eq, best_perf = _plan_eq_perf_with_params(s, lam_niv, tau_niv, alp_niv, div_min=DIVERGENCE_MIN)
 
     def _pack(plan):
         if plan is None:
