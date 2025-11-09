@@ -681,7 +681,7 @@ def sauvegarder_plan(path_csv, sujet, plan, etiquette):
         'Desequilibre_std_pts': round(float(plan['std']), 2),
         'Score': round(float(plan['score']), 2)
     }
-    for m, g in zip(MUSCLES, plan['preds']]:
+    for m, g in zip(MUSCLES, plan['preds']):
         out_row[f'Gain_pred_{m}_%'] = round(float(g), 2)
     df_out = pd.DataFrame([out_row])
     if os.path.exists(path_csv):
