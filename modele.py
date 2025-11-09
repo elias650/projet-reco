@@ -53,10 +53,10 @@ CSV_SORTIE_RECO = "recommandations.csv"
 # ------------------ Hyperparamètres de décision ------------------
 # (1) équilibre : score = mean - LAMBDA_EQ * std
 LAMBDA_EQ        = 0.35     # valeur par défaut (sera recalibrée si LAMBDA_EQ_AUTO=True)
-LAMBDA_EQ_AUTO   = True     # active la calibration data-driven décrite ci-dessous
+LAMBDA_EQ_AUTO   = True     # active la calibration data-driven (objectif clinique)
 LAMBDA_GRID      = np.linspace(0.20, 0.60, 9)  # grille de recherche pour lambda
-ALPHA_PERF       = 0.90     # exigence de performance: mean >= ALPHA_PERF * mean_max
-COVERAGE_TARGET  = 0.70     # proportion minimale de sujets satisfaits (std<=tau et mean>=alpha*mean_max)
+ALPHA_PERF       = 0.90     # exigence: mean >= ALPHA_PERF * mean_max
+COVERAGE_TARGET  = 0.70     # proportion minimale de sujets satisfaits (std<=tau & perf OK)
 # (2) contrainte d'équilibre pour le plan "Performance"
 TAU_STD   = 10.0           # valeur par défaut (sera potentiellement recalibrée)
 TAU_STD_DYNAMIC = True     # calibration automatique de τ
@@ -64,10 +64,16 @@ TAU_STD_DYNAMIC = True     # calibration automatique de τ
 TAU_STD_Q   = 0.40         # quantile des std des sujets performants (40e percentile)
 TAU_STD_MAX = 14.0         # borne haute de τ
 TAU_STD_MIN = 8.0          # borne basse de τ
-# --- Diversité entre les deux plans ---
-DIVERGENCE_MIN = 1.0       # distance min entre plans (|Δ%RM| + |Δseries|)
-# Poids du plan équilibré (utilisé dans recommander_deux_plans)
-LAMBDA_EQ_EFFECTIVE = LAMBDA_EQ  # sera mis à jour si calibration auto
+
+# --- Diversité renforcée entre les deux plans ---
+DIVERGENCE_MIN = 3.0        # distance L1 min dans (%RM, Séries) [points]
+GAIN_DIST_MIN  = 12.0       # distance euclidienne min entre vecteurs de gains [points de %]
+# Fallback progressif si aucune diversité stricte ne passe (toujours avec std<=tau prioritaire)
+RELAX_PARAM_STEPS = [2.0, 1.0, 0.0]   # relâchement distance paramètres
+RELAX_GAIN_STEPS  = [8.0, 5.0, 0.0]   # relâchement distance résultats
+
+# Poids effectif du plan équilibré (maj après calibration)
+LAMBDA_EQ_EFFECTIVE = LAMBDA_EQ
 
 # ==========================================================
 # === UTILITAIRES D'HARMONISATION (niveau) =================
@@ -84,7 +90,7 @@ def canon_niveau_keep_tres_avance(niv: str) -> str:
     if not isinstance(niv, str):
         return 'intermédiaire'
     s = _strip_accents(niv).lower()
-    s = re.sub(r'\s+', ' ', s).strip()  # compresse espaces
+    s = re.sub(r'\s+', ' ', s).strip()
     if s.startswith('deb'):
         return 'débutant'
     if s.startswith('inter'):
@@ -236,7 +242,7 @@ def make_pipe(base_estimator):
 
 for m in MUSCLES:
     ycol = f'Gain_{m}_%'
-    if ycol not in data.columns: 
+    if ycol not in data.columns:
         continue
     X = data[feat_cols]
     y = pd.to_numeric(data[ycol], errors='coerce')
@@ -284,7 +290,7 @@ if len(TEST_SUBJECTS) != len(test):
 
 for m in MUSCLES:
     ycol = f'Gain_{m}_%'
-    if ycol not in data.columns: 
+    if ycol not in data.columns:
         continue
     Xtr, Xte = train[feat_cols], test[feat_cols]
     ytr, yte = train[ycol],  test[ycol]
@@ -320,15 +326,13 @@ def _evaluate_grid_for_row(row, rm_values, series_values):
 # ==========================================================
 # === CALIBRATION DE LAMBDA_EQ (objectif clinique) =========
 # ==========================================================
-LAMBDA_EQ_EFFECTIVE = LAMBDA_EQ  # par défaut
 if LAMBDA_EQ_AUTO:
     print("\n[INFO] Calibration automatique de LAMBDA_EQ (objectif clinique)")
     rm_values = np.linspace(40, 90, 11)
     series_values = np.linspace(4, 12, 9)
 
-    # Pré-calcul pour chaque sujet: (mean_max, tableau des candidats)
     subjects = data[feat_cols + ['Sujets']].dropna().copy()
-    subject_grids = []  # liste d'objets par sujet: dict {'Sujets', 'cands':[(rm,s,mean,std,preds)], 'mean_max':float}
+    subject_grids = []
     for _, row in subjects.iterrows():
         cands = _evaluate_grid_for_row(row, rm_values, series_values)
         mean_max = max(c[2] for c in cands) if cands else np.nan
@@ -342,25 +346,21 @@ if LAMBDA_EQ_AUTO:
             if not cands or not np.isfinite(sg['mean_max']):
                 continue
             total += 1
-            # plan équilibré pour ce lambda
-            best = max(cands, key=lambda t: (t[2] - lmbd * t[3]))  # (rm,s,mean,std,preds)
+            best = max(cands, key=lambda t: (t[2] - lmbd * t[3]))
             mean_ok = best[2] >= ALPHA_PERF * sg['mean_max']
             std_ok  = best[3] <= TAU_STD
             if mean_ok and std_ok:
                 ok += 1
             else:
-                # garder le niveau de violation (pour fallback)
                 viol_std.append(max(0.0, best[3] - TAU_STD))
                 viol_perf.append(max(0.0, (ALPHA_PERF * sg['mean_max']) - best[2]))
         cov = ok / total if total > 0 else 0.0
-        # score de violation moyen (pour discriminer les lambda si aucune n'atteint la couverture cible)
         v_std  = np.mean(viol_std)  if viol_std  else 0.0
         v_perf = np.mean(viol_perf) if viol_perf else 0.0
         return cov, v_std, v_perf
 
-    # Cherche la plus petite lambda qui atteint la couverture cible, sinon minimize les violations
     best_lambda = None
-    best_viol = (1e9, 1e9)  # (std_violation, perf_violation)
+    best_viol = (1e9, 1e9)
     best_lambda_if_fail = LAMBDA_GRID[0]
     for lmbd in LAMBDA_GRID:
         cov, vstd, vperf = _coverage_for_lambda(lmbd)
@@ -368,7 +368,6 @@ if LAMBDA_EQ_AUTO:
         if cov >= COVERAGE_TARGET:
             best_lambda = lmbd
             break
-        # sinon, garder la lambda qui minimise les violations (std en premier, puis perf)
         if (vstd, vperf) < best_viol:
             best_viol = (vstd, vperf)
             best_lambda_if_fail = lmbd
@@ -406,15 +405,18 @@ def recommander(patient_row):
     return best_rm, best_series, best_preds, best_score
 
 def recommander_deux_plans(patient_row):
-    """Deux propositions :
-       - Équilibré : maximise mean - LAMBDA_EQ_EFFECTIVE * std
-       - Performance : maximise mean sous std <= TAU_STD (calibré) et différent du plan équilibré
-         Fallback : std minimal parmi les combinaisons très performantes (>= p75 des moyennes)
+    """Deux propositions bien différenciées :
+       - Équilibré : maximise mean - LAMBDA_EQ_EFFECTIVE * std (lambda calibré)
+       - Performance : maximise mean sous std <= TAU_STD
+                       + diversité paramètres (|Δ%RM| + |Δseries| >= DIVERGENCE_MIN)
+                       + diversité résultats (||gains_perf - gains_eq||2 >= GAIN_DIST_MIN)
+       Fallback déterministe : on relâche progressivement les deux diversités, en gardant
+       la contrainte clinique (std <= TAU_STD) comme priorité n°1.
     """
     rm_values = np.linspace(40, 90, 11)
     series_values = np.linspace(4, 12, 9)
 
-    # 1) Plan équilibré
+    # 1) Plan ÉQUILIBRÉ
     best_eq = {'score': -1e9}
     for rm in rm_values:
         for s in series_values:
@@ -427,44 +429,68 @@ def recommander_deux_plans(patient_row):
                 best_eq = {'score':score_eq, 'rm':rm, 'ser':s,
                            'preds':preds, 'mean':mean_gain, 'std':std_gain}
 
-    # 2) Plan performance (contrainte + diversité)
-    def _dist(p, rm, s):
-        return abs(rm - p['rm']) + abs(s - p['ser'])
+    # Helpers distances
+    def _param_dist(rm, s, plan_ref):
+        return abs(rm - plan_ref['rm']) + abs(s - plan_ref['ser'])
 
-    best_perf = {'score': -1e9}
-    CANDIDATES = []
+    def _gain_dist(preds, plan_ref):
+        return float(np.linalg.norm(preds - plan_ref['preds']))  # euclidienne
+
+    # 2) Plan PERFORMANCE (std<=tau + double diversité)
+    candidates = []
     for rm in rm_values:
         for s in series_values:
             row = patient_row.copy()
             row['%RM_num'] = rm
             row['Séries/semaine'] = s
             preds, mean_gain, std_gain = _predict_gains_from_row(row)
-            CANDIDATES.append((mean_gain, std_gain, rm, s, preds))
-            if std_gain <= TAU_STD and _dist(best_eq, rm, s) >= DIVERGENCE_MIN:
-                if mean_gain > best_perf['score']:
-                    best_perf = {'score':mean_gain, 'rm':rm, 'ser':s,
-                                 'preds':preds, 'mean':mean_gain, 'std':std_gain}
+            candidates.append((rm, s, mean_gain, std_gain, preds))
 
-    # 3) Fallback si rien ne passe
-    if best_perf['score'] == -1e9:
-        if CANDIDATES:
-            means = np.array([c[0] for c in CANDIDATES])
-            p75 = np.percentile(means, 75)
-            pool = [c for c in CANDIDATES if c[0] >= p75] or CANDIDATES
-            pool.sort(key=lambda z: (z[1], -z[0]))  # std ↑ puis mean ↓
-            for mean_gain, std_gain, rm, s, preds in pool:
-                if _dist(best_eq, rm, s) >= DIVERGENCE_MIN:
-                    best_perf = {'score':mean_gain, 'rm':rm, 'ser':s,
-                                 'preds':preds, 'mean':mean_gain, 'std':std_gain}
-                    break
-            if best_perf['score'] == -1e9:
-                mean_gain, std_gain, rm, s, preds = pool[0]
-                best_perf = {'score':mean_gain, 'rm':rm, 'ser':s,
-                             'preds':preds, 'mean':mean_gain, 'std':std_gain}
-        else:
-            best_perf = {'score': -1e9, 'rm': np.nan, 'ser': np.nan,
-                         'preds': np.array([np.nan]*len(MUSCLES)), 'mean': np.nan, 'std': np.nan}
+    feasible = [(rm, s, m, sd, p) for (rm, s, m, sd, p) in candidates if sd <= TAU_STD]
 
+    # stricte diversité
+    perf_strict = []
+    for rm, s, m, sd, p in feasible:
+        if _param_dist(rm, s, best_eq) >= DIVERGENCE_MIN and _gain_dist(p, best_eq) >= GAIN_DIST_MIN:
+            perf_strict.append((rm, s, m, sd, p))
+
+    if perf_strict:
+        rm, s, m, sd, p = max(perf_strict, key=lambda t: t[2])
+        best_perf = {'score':m, 'rm':rm, 'ser':s, 'preds':p, 'mean':m, 'std':sd}
+        return best_eq, best_perf
+
+    # 3) Fallback progressif
+    for relax_param in RELAX_PARAM_STEPS:
+        # d'abord relâche paramètre (résultat encore strict)
+        perf_relax_param = []
+        for rm, s, m, sd, p in feasible:
+            if _param_dist(rm, s, best_eq) >= relax_param and _gain_dist(p, best_eq) >= GAIN_DIST_MIN:
+                perf_relax_param.append((rm, s, m, sd, p))
+        if perf_relax_param:
+            rm, s, m, sd, p = max(perf_relax_param, key=lambda t: t[2])
+            best_perf = {'score':m, 'rm':rm, 'ser':s, 'preds':p, 'mean':m, 'std':sd}
+            return best_eq, best_perf
+
+        # puis relâche aussi la diversité résultat
+        for relax_gain in RELAX_GAIN_STEPS:
+            perf_relax_both = []
+            for rm, s, m, sd, p in feasible:
+                if _param_dist(rm, s, best_eq) >= relax_param and _gain_dist(p, best_eq) >= relax_gain:
+                    perf_relax_both.append((rm, s, m, sd, p))
+            if perf_relax_both:
+                rm, s, m, sd, p = max(perf_relax_both, key=lambda t: t[2])
+                best_perf = {'score':m, 'rm':rm, 'ser':s, 'preds':p, 'mean':m, 'std':sd}
+                return best_eq, best_perf
+
+    # 4) Ultime fallback : meilleur mean sous std<=tau
+    if feasible:
+        rm, s, m, sd, p = max(feasible, key=lambda t: t[2])
+        best_perf = {'score':m, 'rm':rm, 'ser':s, 'preds':p, 'mean':m, 'std':sd}
+        return best_eq, best_perf
+
+    # 5) Rien de faisable (rare)
+    best_perf = {'score': -1e9, 'rm': np.nan, 'ser': np.nan,
+                 'preds': np.array([np.nan]*len(MUSCLES)), 'mean': np.nan, 'std': np.nan}
     return best_eq, best_perf
 
 def _afficher_plan(titre, plan):
@@ -595,6 +621,15 @@ if __name__ == "__main__":
             print(">>> Optimisation terminée\n")
             _afficher_plan("=== OPTION 1 — PLAN ÉQUILIBRÉ ===", best_eq)
             _afficher_plan(f"=== OPTION 2 — PLAN PERFORMANCE (std ≤ τ={TAU_STD:.1f}) ===", best_perf)
+
+            # Afficher les distances de diversité obtenues (diagnostic)
+            if not (isinstance(best_perf.get('rm', np.nan), float) and np.isnan(best_perf.get('rm', np.nan))):
+                param_dist = abs(best_perf['rm'] - best_eq['rm']) + abs(best_perf['ser'] - best_eq['ser'])
+                gain_dist  = float(np.linalg.norm(best_perf['preds'] - best_eq['preds']))
+                print(f"--- Diversité mesurée ---")
+                print(f"Distance paramètres (|Δ%RM|+|ΔSéries|): {param_dist:.2f} (seuil {DIVERGENCE_MIN})")
+                print(f"Distance résultats (euclidienne gains): {gain_dist:.2f} (seuil {GAIN_DIST_MIN})")
+
             sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], best_eq, "Equilibre")
             sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], best_perf, "Performance_contrainte")
             print(f"✔ Deux propositions enregistrées (si disponibles) dans '{CSV_SORTIE_RECO}'")
