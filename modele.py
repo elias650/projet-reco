@@ -9,6 +9,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.linear_model import RidgeCV
 from sklearn.ensemble import RandomForestRegressor
 
+# -------------------- chemins --------------------
 def csv_path(name: str) -> str:
     for base in ["data", "Data"]:
         p = os.path.join(base, "anonymes", name)
@@ -27,32 +28,31 @@ MUSCLES = ["Ext hanche D","Ext hanche G","Flx genou D","Flx genou G","Ext genou 
 TEST_SUBJECTS_DEFAULT = ['Alexia','Romain','Elise']
 CSV_SORTIE_RECO = "recommandations.csv"
 
+# -------------------- hyperparamètres décisionnels --------------------
 LAMBDA_EQ        = 0.35
 LAMBDA_EQ_AUTO   = True
 LAMBDA_GRID      = np.linspace(0.20, 0.60, 9)
 ALPHA_PERF       = 0.90
 COVERAGE_TARGET  = 0.70
 
+# Calibrage automatique d’un seuil clinique d’écart-type (utilisé uniquement pour info et option Équilibre)
 TAU_STD          = 10.0
 TAU_STD_DYNAMIC  = True
 TAU_STD_Q        = 0.30
 TAU_STD_MAX      = 12.0
 TAU_STD_MIN      = 8.0
 
-# Divergence forte entre plans
-MIN_DELTA_RM       = 10.0   # |Δ%RM| minimal
-MIN_DELTA_SERIES   = 3.0    # |ΔSéries| minimal
-DIVERGENCE_MIN     = 10.0   # |Δ%RM| + |ΔSéries|
-GAIN_DIST_MIN      = 28.0   # distance euclidienne sur gains
-MAX_COS_SIM        = 0.85   # similarité cosinus max entre profils de gains
-TOPK_QUANTILE      = 0.90   # top 10% en gain moyen
-
-RELAX_PARAM_STEPS  = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0]
-RELAX_GAIN_STEPS   = [24.0, 22.0, 20.0, 18.0, 16.0, 12.0, 8.0, 0.0]
-RELAX_COS_STEPS    = [0.87, 0.89, 0.91, 0.93, 0.95, 0.99]
+# Divergence minimale entre les deux plans (pour éviter 2 propositions quasi identiques)
+MIN_DELTA_RM       = 8.0    # |Δ%RM| minimal
+MIN_DELTA_SERIES   = 2.0    # |ΔSéries| minimal
+DIVERGENCE_MIN     = 10.0   # |Δ%RM| + |ΔSéries| minimal
+GAIN_DIST_MIN      = 24.0   # distance euclidienne minimale entre vecteurs de gains (6 muscles)
+MAX_COS_SIM        = 0.90   # similarité cosinus max (profils vraiment différents)
+TOPK_QUANTILE      = 0.90   # quand on a besoin de différencier, on considère d’abord le top 10% en moyenne
 
 LAMBDA_EQ_EFFECTIVE = LAMBDA_EQ
 
+# -------------------- utilitaires --------------------
 def _strip_accents(s: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
@@ -75,6 +75,7 @@ def normalize_df(df):
     df = df.drop_duplicates(subset=['Sujets'], keep='first')
     return df
 
+# -------------------- lecture --------------------
 info  = pd.read_csv(CSV_INFOS, sep=';', decimal=',', encoding='latin1')
 j0    = pd.read_csv(CSV_J0,    sep=';', decimal=',', encoding='latin1')
 j6    = pd.read_csv(CSV_J6,    sep=';', decimal=',', encoding='latin1')
@@ -104,6 +105,7 @@ set_info = set(info['Sujets']); set_j0 = set(j0['Sujets']); set_j6 = set(j6['Suj
 print("Sujets manquants dans Interventions :", sorted(set_info - set_int))
 print("Sujets en trop dans Interventions   :", sorted(set_int - set_info))
 
+# -------------------- sujets test --------------------
 all_ids = sorted(set(info['Sujets'].astype(str).str.strip()))
 DEFAULT_TEST = [f"Sujet{i}" for i in range(1, 50)]
 TEST_SUBJECTS = [x for x in TEST_SUBJECTS_DEFAULT if x in all_ids]
@@ -114,6 +116,7 @@ if not TEST_SUBJECTS:
     TEST_SUBJECTS = all_ids[:min(3, len(all_ids))]
 print("TEST utilisé :", TEST_SUBJECTS)
 
+# -------------------- fusion & features --------------------
 for m in MUSCLES:
     if m in j0.columns: j0[m] = pd.to_numeric(j0[m], errors='coerce')
     if m in j6.columns: j6[m] = pd.to_numeric(j6[m], errors='coerce')
@@ -135,6 +138,7 @@ def rm_to_numeric(v):
     except: return np.nan
 data['%RM_num'] = data['%RM'].apply(rm_to_numeric)
 
+# -------------------- tau std (info) --------------------
 if TAU_STD_DYNAMIC:
     gains = data[[f"Gain_{m}_%" for m in MUSCLES]].copy().dropna()
     if len(gains) > 0:
@@ -153,6 +157,7 @@ if TAU_STD_DYNAMIC:
 else:
     print(f"\n[INFO] TAU_STD fixé = {TAU_STD:.1f}")
 
+# -------------------- ML : features & pipeline --------------------
 Y_cols = [f"Gain_{m}_%" for m in MUSCLES]
 info_cols = [c for c in info.columns if c != 'Sujets']
 j0_cols = [f"{m}_J0" for m in MUSCLES if f"{m}_J0" in data.columns]
@@ -168,6 +173,7 @@ prep = ColumnTransformer([
     ('cat', OneHotEncoder(handle_unknown='ignore'), cat_cols)
 ])
 
+# -------------------- entraînement par muscle --------------------
 loo = LeaveOneOut()
 MODELS, rows = {}, []
 
@@ -204,6 +210,7 @@ perf = pd.DataFrame(rows)
 print("\n=== Performances LOOCV (meilleur modèle par muscle) ===")
 print(perf.to_string(index=False))
 
+# -------------------- split test --------------------
 print("\n=== Split train/test explicite ===")
 train = data[~data['Sujets'].isin(TEST_SUBJECTS)].copy()
 test  = data[ data['Sujets'].isin(TEST_SUBJECTS)].copy()
@@ -224,6 +231,7 @@ for m in MUSCLES:
     else:
         print(f"[TEST] {m}: n=0")
 
+# -------------------- outils d’évaluation --------------------
 def _predict_gains_from_row(row_dict):
     x = pd.DataFrame([row_dict[feat_cols]])
     preds = np.array([MODELS[m].predict(x)[0] for m in MUSCLES])
@@ -239,6 +247,7 @@ def _evaluate_grid_for_row(row, rm_values, series_values):
             out.append((rm, s, mean_gain, std_gain, preds))
     return out
 
+# -------------------- calibration LAMBDA_EQ --------------------
 if LAMBDA_EQ_AUTO:
     print("\n[INFO] Calibration automatique de LAMBDA_EQ")
     rm_values = np.linspace(40, 90, 11); series_values = np.linspace(4, 12, 9)
@@ -280,6 +289,7 @@ else:
     LAMBDA_EQ_EFFECTIVE = LAMBDA_EQ
     print(f"\n[INFO] LAMBDA_EQ = {LAMBDA_EQ_EFFECTIVE:.2f}")
 
+# -------------------- plan unique (démo console) --------------------
 print("\n>>> Patient utilisé pour la recommandation : (échantillon aléatoire)")
 patient_row = data.sample(1).iloc[0]
 print({k: patient_row[k] for k in list(data.columns)[:8]}, "...")
@@ -296,6 +306,7 @@ def recommander(patient_row):
                 best = {'score':score,'rm':rm,'ser':s,'preds':preds,'mean':mean_gain,'std':std_gain}
     return best['rm'], best['ser'], best['preds'], best['score']
 
+# -------------------- deux plans : Équilibre vs Performance (gain total max) --------------------
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     an = np.linalg.norm(a); bn = np.linalg.norm(b)
     if an == 0 or bn == 0: return 1.0
@@ -305,6 +316,7 @@ def recommander_deux_plans(patient_row):
     rm_all     = np.linspace(40, 90, 11)
     series_all = np.linspace(4, 12, 9)
 
+    # Option 1 : ÉQUILIBRÉ (moyenne - lambda*std)
     best_eq = {'score': -1e9}
     for rm in rm_all:
         for s in series_all:
@@ -316,6 +328,7 @@ def recommander_deux_plans(patient_row):
             if score_eq > best_eq['score']:
                 best_eq = {'score':score_eq,'rm':rm,'ser':s,'preds':preds,'mean':mean_gain,'std':std_gain}
 
+    # Option 2 : PERFORMANCE (maximise la moyenne, ignore le std)
     candidates = []
     for rm in rm_all:
         for s in series_all:
@@ -323,59 +336,41 @@ def recommander_deux_plans(patient_row):
             row['%RM_num'] = rm
             row['Séries/semaine'] = s
             preds, mean_gain, std_gain = _predict_gains_from_row(row)
-            if std_gain <= TAU_STD:
-                candidates.append((rm, s, mean_gain, std_gain, preds))
+            candidates.append((rm, s, mean_gain, std_gain, preds))
 
-    if not candidates:
-        best_perf = {'score': -1e9, 'rm': np.nan, 'ser': np.nan,
-                     'preds': np.array([np.nan]*len(MUSCLES)), 'mean': np.nan, 'std': np.nan}
-        return best_eq, best_perf
+    # tri décroissant par moyenne
+    candidates.sort(key=lambda c: c[2], reverse=True)
 
+    def _param_L1(c): return abs(c[0] - best_eq['rm']) + abs(c[1] - best_eq['ser'])
+    def _gain_dist(c): return float(np.linalg.norm(c[4] - best_eq['preds']))
+    def _diverse_enough(c):
+        return (abs(c[0]-best_eq['rm']) >= MIN_DELTA_RM and
+                abs(c[1]-best_eq['ser']) >= MIN_DELTA_SERIES and
+                _param_L1(c) >= DIVERGENCE_MIN and
+                _gain_dist(c) >= GAIN_DIST_MIN and
+                _cosine_sim(c[4], best_eq['preds']) <= MAX_COS_SIM)
+
+    # on tente d’abord top-10% pour éviter la même moyenne
     means = np.array([c[2] for c in candidates])
     thr = np.quantile(means, TOPK_QUANTILE)
     topk = [c for c in candidates if c[2] >= thr]
 
-    def _param_L1(c): return abs(c[0] - best_eq['rm']) + abs(c[1] - best_eq['ser'])
-    def _gain_dist(c): return float(np.linalg.norm(c[4] - best_eq['preds']))
-    def _cos_ok(c, max_cos=MAX_COS_SIM): return _cosine_sim(c[4], best_eq['preds']) <= max_cos
-    def _hard_ok(c, min_rm=MIN_DELTA_RM, min_ser=MIN_DELTA_SERIES, min_L1=DIVERGENCE_MIN, min_g=GAIN_DIST_MIN, max_cos=MAX_COS_SIM):
-        return (abs(c[0]-best_eq['rm']) >= min_rm and
-                abs(c[1]-best_eq['ser']) >= min_ser and
-                _param_L1(c) >= min_L1 and
-                _gain_dist(c) >= min_g and
-                _cos_ok(c, max_cos))
-
-    strict = [c for c in topk if _hard_ok(c)]
+    strict = [c for c in topk if _diverse_enough(c)]
     if strict:
+        # parmi ces très bons candidats, on prend celui le plus différent en résultats
         strict.sort(key=lambda c: (_gain_dist(c), -_cosine_sim(c[4], best_eq['preds']), c[2]), reverse=True)
         rm, s, m, sd, p = strict[0]
-        best_perf = {'score': m, 'rm': rm, 'ser': s, 'preds': p, 'mean': m, 'std': sd}
-        return best_eq, best_perf
+        return best_eq, {'score': m, 'rm': rm, 'ser': s, 'preds': p, 'mean': m, 'std': sd, 'note': 'MaxMean_topK+divers'}
 
-    feasible = topk
-    chosen = None
-    for relax_p in RELAX_PARAM_STEPS:
-        for relax_g in RELAX_GAIN_STEPS:
-            for relax_cos in RELAX_COS_STEPS:
-                cand = [c for c in feasible
-                        if (abs(c[0]-best_eq['rm']) >= max(MIN_DELTA_RM-relax_p,0.0) and
-                            abs(c[1]-best_eq['ser']) >= max(MIN_DELTA_SERIES-relax_p,0.0) and
-                            _param_L1(c) >= max(DIVERGENCE_MIN-relax_p,0.0) and
-                            _gain_dist(c) >= max(GAIN_DIST_MIN-relax_g,0.0) and
-                            _cos_ok(c, max(relax_cos, MAX_COS_SIM)))]
-                if cand:
-                    cand.sort(key=lambda c: (_gain_dist(c), -_cosine_sim(c[4], best_eq['preds']), c[2]), reverse=True)
-                    chosen = cand[0]; break
-            if chosen: break
-        if chosen: break
+    # sinon, on prend le meilleur mean suivant qui respecte au moins une différence paramétrique
+    for c in candidates:
+        if (abs(c[0]-best_eq['rm']) >= MIN_DELTA_RM or abs(c[1]-best_eq['ser']) >= MIN_DELTA_SERIES):
+            rm, s, m, sd, p = c
+            return best_eq, {'score': m, 'rm': rm, 'ser': s, 'preds': p, 'mean': m, 'std': sd, 'note': 'MaxMean_paramDiff'}
 
-    if not chosen:
-        rm, s, m, sd, p = max(feasible, key=lambda c: (_gain_dist(c), c[2]))
-        chosen = (rm, s, m, sd, p)
-
-    rm, s, m, sd, p = chosen
-    best_perf = {'score': m, 'rm': rm, 'ser': s, 'preds': p, 'mean': m, 'std': sd}
-    return best_eq, best_perf
+    # ultime recours : le tout meilleur mean même s’il est identique en paramètres (le praticien est informé)
+    rm, s, m, sd, p = candidates[0]
+    return best_eq, {'score': m, 'rm': rm, 'ser': s, 'preds': p, 'mean': m, 'std': sd, 'note': 'MaxMean_sameParams'}
 
 def _afficher_plan(titre, plan):
     print(titre)
@@ -386,7 +381,8 @@ def _afficher_plan(titre, plan):
     for m, g in zip(MUSCLES, plan['preds']): print(f"    - {m}: {g:.2f}%")
     print(f"  Score: {plan['score']:.2f}")
 
-print("\n>>> Patient utilisé pour la recommandation : (démo plan unique)")
+# -------------------- démo plan unique --------------------
+print("\n>>> Patient utilisé pour la recommandation (démo plan unique)")
 opt_rm, opt_ser, opt_preds, opt_score = recommander(patient_row)
 print("=== Recommandation OPTIMALE & ÉQUILIBRÉE (plan unique) ===")
 print(f"%RM recommandé : {opt_rm:.1f}")
@@ -395,6 +391,7 @@ print("Gains prédits (%):")
 for m, g in zip(MUSCLES, opt_preds): print(f"  - {m}: {g:.2f}")
 print(f"Score global (moy - écart-type) : {opt_score:.2f}")
 
+# -------------------- I/O console & CSV --------------------
 def _safe_input(prompt, default=None, dtype=str):
     s = input(prompt).strip()
     if s == "": return default
@@ -464,6 +461,7 @@ def sauvegarder_plan(path_csv, sujet, plan, etiquette):
     else:
         df_out.to_csv(path_csv, sep=';', decimal=',', index=False, encoding='latin1')
 
+# -------------------- mode interactif --------------------
 if __name__ == "__main__":
     while True:
         choice = input("\nSaisir un NOUVEAU patient ? (o=1 plan / 2=deux plans / n=non) : ").strip().lower()
@@ -475,18 +473,16 @@ if __name__ == "__main__":
             best_eq, best_perf = recommander_deux_plans(patient_new)
             print(">>> Optimisation terminée\n")
             _afficher_plan("=== OPTION 1 — ÉQUILIBRE ===", best_eq)
-            _afficher_plan(f"=== OPTION 2 — PERFORMANCE (std ≤ τ={TAU_STD:.1f}) ===", best_perf)
-            if not (isinstance(best_perf.get('rm', np.nan), float) and np.isnan(best_perf.get('rm', np.nan))):
-                param_dist = abs(best_perf['rm'] - best_eq['rm']) + abs(best_perf['ser'] - best_eq['ser'])
-                gain_dist  = float(np.linalg.norm(best_perf['preds'] - best_eq['preds']))
-                cos_sim    = _cosine_sim(best_perf['preds'], best_eq['preds'])
-                print(f"--- Diversité ---")
-                print(f"|Δ%RM| ≥ {MIN_DELTA_RM} et |ΔSéries| ≥ {MIN_DELTA_SERIES}")
-                print(f"L1 paramètres: {param_dist:.2f} ≥ {DIVERGENCE_MIN}")
-                print(f"Distance gains: {gain_dist:.2f} ≥ {GAIN_DIST_MIN}")
-                print(f"Cosine similarity: {cos_sim:.3f} ≤ {MAX_COS_SIM}")
+            _afficher_plan("=== OPTION 2 — PERFORMANCE (gain total max) ===", best_perf)
+            # feedback différence
+            param_dist = abs(best_perf['rm'] - best_eq['rm']) + abs(best_perf['ser'] - best_eq['ser'])
+            gain_dist  = float(np.linalg.norm(best_perf['preds'] - best_eq['preds']))
+            cos_sim    = _cosine_sim(best_perf['preds'], best_eq['preds'])
+            print(f"--- Différences ---")
+            print(f"|Δ%RM|={abs(best_perf['rm']-best_eq['rm']):.1f} ; |ΔSéries|={abs(best_perf['ser']-best_eq['ser']):.1f} ; L1={param_dist:.1f}")
+            print(f"Distance gains: {gain_dist:.2f} ; Cosine similarity: {cos_sim:.3f}")
             sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], best_eq, "Equilibre")
-            sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], best_perf, "Performance_contrainte")
+            sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], best_perf, "Performance_maxMean")
             print(f"✔ Deux propositions enregistrées dans '{CSV_SORTIE_RECO}'")
         else:
             print("\n>>> Début optimisation (PLAN UNIQUE)")
@@ -502,6 +498,7 @@ if __name__ == "__main__":
             sauvegarder_recommandation(CSV_SORTIE_RECO, patient_new['Sujets'], opt_rm2, opt_ser2, opt_preds2, opt_score2)
             print(f"✔ Recommandation enregistrée dans '{CSV_SORTIE_RECO}'")
 
+# -------------------- API Streamlit --------------------
 def reco_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
                        hip_ext_G, hip_ext_D, knee_flex_G, knee_flex_D, knee_ext_G, knee_ext_D):
     row = {'Sujets': 'API_patient','âge': age,'sexe': sexe,'poids': poids,
