@@ -1,144 +1,126 @@
-# app.py — version 2-plans (équilibré + performance) — champs force à 3 décimales
-
+# app.py
 import streamlit as st
-
-# ---------------------------------------------------------
-# Cache module + reload pour éviter le cache de Streamlit Cloud
-# Incrémente 'version' si tu modifies fortement modele.py pour casser le cache.
-# ---------------------------------------------------------
-@st.cache_resource(show_spinner=True)
-def get_model_module(version: int = 3):
-    import importlib
-    import modele  # ton fichier modele.py
-    importlib.reload(modele)
-    return modele
-
-modele = get_model_module()
-MUSCLES = modele.MUSCLES
-
-# On essaie la nouvelle API (2 plans). Si absente, fallback sur l'historique (1 plan).
-reco2_depuis_inputs = getattr(modele, "reco2_depuis_inputs", None)
-reco_depuis_inputs  = getattr(modele, "reco_depuis_inputs",  None)
-
-# ---------------------------------------------------------
-# UI de base
-# ---------------------------------------------------------
-st.set_page_config(page_title="Reco Renforcement (6 semaines)", layout="centered")
-st.title("Recommandation d’intervention — 6 semaines")
-
-st.caption(
-    "Renseigne les informations de base et les niveaux de force (0–100). "
-    "L’application propose jusqu’à **deux plans** : un **Équilibré** (mean − λ·std) et un **Performance** "
-    "(maximisation du gain moyen sous contrainte d’équilibre)."
+import pandas as pd
+from modele import (
+    MUSCLES,
+    reco_depuis_inputs,   # plan unique (Équilibre)
+    reco3_depuis_inputs,  # trois plans (Équilibre / Performance / Stabilité)
 )
 
-# ---------------------------------------------------------
-# Informations de base
-# ---------------------------------------------------------
-c1, c2, c3 = st.columns(3)
-age    = c1.number_input("Âge", min_value=10, max_value=100, value=28)
-poids  = c2.number_input("Poids (kg)", min_value=30.0, max_value=200.0, value=70.0, step=0.5)
-sexe   = c3.selectbox("Sexe", ["H", "F", "Autre"])
+st.set_page_config(page_title="Reco d'intervention", layout="wide")
 
-# Latéralité : sans "ambidextre"
-lat    = st.selectbox("Latéralité", ["droitier", "gaucher"])
+st.title("Recommandation d'intervention — Cohorte 1")
 
-# Niveau de pratique : inclut "très avancé"
-niv    = st.selectbox("Niveau de pratique", ["débutant", "intermédiaire", "avancé", "très avancé"])
+st.markdown(
+    "Choisis le mode de recommandation puis saisis les caractéristiques du patient et ses forces à **J0**."
+)
 
-one_rm = st.number_input("1RM de référence (kg)", min_value=10.0, max_value=300.0, value=100.0, step=0.5)
+# -------------------- Saisie patient --------------------
+with st.expander("Informations initiales", expanded=True):
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        age = st.number_input("Âge (années)", min_value=14, max_value=100, value=22)
+        sexe = st.selectbox("Sexe", ["H", "F"], index=0)
+        poids = st.number_input("Poids (kg)", min_value=30.0, max_value=200.0, value=70.0, step=0.1)
+    with c2:
+        lateralite = st.selectbox("Latéralité", ["droitier", "gaucher", "ambidextre"], index=0)
+        niveau = st.selectbox("Niveau", ["débutant", "intermédiaire", "avancé", "très avancé"], index=1)
+        one_rm = st.number_input("1RM (kg)", min_value=10.0, max_value=300.0, value=100.0, step=0.1)
 
-# ---------------------------------------------------------
-# Niveaux de force (3 décimales)
-# ---------------------------------------------------------
-with st.container(border=True):
-    st.subheader("Niveaux de force normalisés (0–100, précision 0,001)")
-    cL, cR = st.columns(2)
+with st.expander("Forces à J0 (moyennes par groupe musculaire)", expanded=True):
+    cA, cB, cC = st.columns(3)
+    with cA:
+        hip_ext_G = st.number_input("Ext hanche G — J0", min_value=0.0, value=5.0, step=0.001, format="%.6f")
+        hip_ext_D = st.number_input("Ext hanche D — J0", min_value=0.0, value=5.0, step=0.001, format="%.6f")
+    with cB:
+        knee_flex_G = st.number_input("Flx genou G — J0", min_value=0.0, value=3.0, step=0.001, format="%.6f")
+        knee_flex_D = st.number_input("Flx genou D — J0", min_value=0.0, value=3.0, step=0.001, format="%.6f")
+    with cC:
+        knee_ext_G = st.number_input("Ext genou G — J0", min_value=0.0, value=5.0, step=0.001, format="%.6f")
+        knee_ext_D = st.number_input("Ext genou D — J0", min_value=0.0, value=5.0, step=0.001, format="%.6f")
 
-    hip_ext_G   = cL.number_input("Extenseurs de hanche — Gauche",  min_value=0.0, max_value=100.0, value=55.0, step=0.001, format="%.3f")
-    hip_ext_D   = cR.number_input("Extenseurs de hanche — Droite",  min_value=0.0, max_value=100.0, value=60.0, step=0.001, format="%.3f")
-    knee_flex_G = cL.number_input("Fléchisseurs de genou — Gauche", min_value=0.0, max_value=100.0, value=60.0, step=0.001, format="%.3f")
-    knee_flex_D = cR.number_input("Fléchisseurs de genou — Droite", min_value=0.0, max_value=100.0, value=62.0, step=0.001, format="%.3f")
-    knee_ext_G  = cL.number_input("Extenseurs de genou — Gauche",   min_value=0.0, max_value=100.0, value=52.0, step=0.001, format="%.3f")
-    knee_ext_D  = cR.number_input("Extenseurs de genou — Droite",   min_value=0.0, max_value=100.0, value=58.0, step=0.001, format="%.3f")
+# -------------------- Mode --------------------
+mode = st.radio(
+    "Mode de recommandation",
+    ["Plan unique (Équilibre)", "Trois plans (Équilibre / Performance / Stabilité)"],
+    horizontal=True,
+)
 
-st.divider()
+# -------------------- Calcul --------------------
+if st.button("Calculer la/les recommandations"):
+    if mode.startswith("Plan unique"):
+        pct_rm, series, gains, score = reco_depuis_inputs(
+            age, poids, sexe, lateralite, niveau, one_rm,
+            hip_ext_G, hip_ext_D, knee_flex_G, knee_flex_D, knee_ext_G, knee_ext_D
+        )
+        st.subheader("Plan Équilibre (mean − λ·std)")
+        mcol1, mcol2 = st.columns([1,1])
+        with mcol1:
+            st.metric("%RM recommandé", f"{pct_rm:.1f}")
+            st.metric("Séries/semaine", f"{series:.1f}")
+        with mcol2:
+            st.metric("Score (mean−λ·std)", f"{score:.2f}")
+        df = pd.DataFrame({"Muscle": MUSCLES, "Gain prédit (%)": [round(g,2) for g in gains]})
+        st.dataframe(df, hide_index=True, use_container_width=True)
 
-# ---------------------------------------------------------
-# Bouton d'action : propose 2 plans si dispo, sinon fallback à 1 plan
-# ---------------------------------------------------------
-if st.button("Proposer l’intervention optimale"):
-    with st.spinner("Calcul en cours..."):
-        # normalisation simple (évite espaces/variantes)
-        lat_norm = lat.strip().lower()
-        niv_norm = niv.strip().lower()
+    else:
+        plans = reco3_depuis_inputs(
+            age, poids, sexe, lateralite, niveau, one_rm,
+            hip_ext_G, hip_ext_D, knee_flex_G, knee_flex_D, knee_ext_G, knee_ext_D
+        )
 
-        if callable(reco2_depuis_inputs):
-            # --- NOUVELLE API : deux plans ---
-            res = reco2_depuis_inputs(
-                age, poids, sexe, lat_norm, niv_norm, one_rm,
-                hip_ext_G, hip_ext_D, knee_flex_G, knee_flex_D, knee_ext_G, knee_ext_D
-            )
-            plan_eq  = res.get("equilibre", {})
-            plan_pf  = res.get("performance", {})
+        # Mise en forme des trois plans
+        def plan_card(titre, plan, help_text=""):
+            st.markdown(f"### {titre}")
+            if help_text:
+                st.caption(help_text)
+            top = st.columns(3)
+            top[0].metric("%RM", f"{plan['rm']:.1f}")
+            top[1].metric("Séries/sem", f"{plan['series']:.1f}")
+            top[2].metric("Score (mean−λ·std)", f"{plan['score']:.2f}")
+            mid = st.columns(2)
+            mid[0].metric("Gain moyen (%)", f"{plan['mean']:.2f}")
+            mid[1].metric("Écart-type (pts)", f"{plan['std']:.2f}")
+            dfp = pd.DataFrame({"Muscle": MUSCLES, "Gain prédit (%)": [round(g,2) for g in plan["gains"]]})
+            st.dataframe(dfp, hide_index=True, use_container_width=True)
 
-            c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            plan_card("Option 1 — Équilibre", plans["equilibre"], "Optimise mean − λ·std (λ calibré).")
+        with c2:
+            plan_card("Option 2 — Performance", plans["performance"], "Maximise la moyenne des gains.")
+        with c3:
+            plan_card("Option 3 — Stabilité", plans["stabilite"], "Minimise l’écart-type (départage par la moyenne).")
 
-            # ------ Option 1 : Équilibré ------
-            with c1:
-                st.subheader("Option 1 — Équilibré")
-                if plan_eq.get("rm") is None:
-                    st.info("Aucun plan équilibré disponible pour ces entrées.")
-                else:
-                    st.success(f"%RM : **{plan_eq['rm']:.1f}%**  •  Séries/sem : **{plan_eq['series']:.1f}**")
-                    st.caption(
-                        f"Gain moyen estimé : **{plan_eq['mean']:.2f}%**  •  "
-                        f"Déséquilibre (écart-type) : **{plan_eq['std']:.2f}**  •  "
-                        f"Score : **{plan_eq['score']:.2f}**"
-                    )
-                    st.markdown("**Gains estimés par groupe (%)**")
-                    gains_eq = plan_eq.get("gains", [])
-                    for m, g in zip(MUSCLES, gains_eq):
-                        st.write(f"- **{m}** : {g:.2f} %")
+        # Tableau comparatif
+        comp = pd.DataFrame([
+            {
+                "Option": "Équilibre",
+                "%RM": round(plans["equilibre"]["rm"],1),
+                "Séries/sem": round(plans["equilibre"]["series"],1),
+                "Gain moyen (%)": round(plans["equilibre"]["mean"],2),
+                "Écart-type (pts)": round(plans["equilibre"]["std"],2),
+                "Score (mean−λ·std)": round(plans["equilibre"]["score"],2),
+            },
+            {
+                "Option": "Performance",
+                "%RM": round(plans["performance"]["rm"],1),
+                "Séries/sem": round(plans["performance"]["series"],1),
+                "Gain moyen (%)": round(plans["performance"]["mean"],2),
+                "Écart-type (pts)": round(plans["performance"]["std"],2),
+                "Score (mean−λ·std)": round(plans["performance"]["score"],2),
+            },
+            {
+                "Option": "Stabilité",
+                "%RM": round(plans["stabilite"]["rm"],1),
+                "Séries/sem": round(plans["stabilite"]["series"],1),
+                "Gain moyen (%)": round(plans["stabilite"]["mean"],2),
+                "Écart-type (pts)": round(plans["stabilite"]["std"],2),
+                "Score (mean−λ·std)": round(plans["stabilite"]["score"],2),
+            },
+        ])
+        st.markdown("#### Comparatif synthétique")
+        st.dataframe(comp, hide_index=True, use_container_width=True)
 
-            # ------ Option 2 : Performance ------
-            with c2:
-                st.subheader("Option 2 — Performance (contrainte)")
-                if plan_pf.get("rm") is None:
-                    st.info("Aucun plan performance disponible répondant aux contraintes.")
-                else:
-                    st.success(f"%RM : **{plan_pf['rm']:.1f}%**  •  Séries/sem : **{plan_pf['series']:.1f}**")
-                    st.caption(
-                        f"Gain moyen estimé : **{plan_pf['mean']:.2f}%**  •  "
-                        f"Déséquilibre (écart-type) : **{plan_pf['std']:.2f}**  •  "
-                        f"Score : **{plan_pf['score']:.2f}**"
-                    )
-                    st.markdown("**Gains estimés par groupe (%)**")
-                    gains_pf = plan_pf.get("gains", [])
-                    for m, g in zip(MUSCLES, gains_pf):
-                        st.write(f"- **{m}** : {g:.2f} %")
-
-            st.caption(
-                "Note : le plan **Équilibré** maximise *mean − λ·std* ; "
-                "le plan **Performance** maximise le gain moyen sous contrainte d'équilibre (τ) et reste distinct de l'option 1."
-            )
-
-        elif callable(reco_depuis_inputs):
-            # --- FALLBACK : ancienne API 1 plan ---
-            pct_rm, series_sem, gains, score = reco_depuis_inputs(
-                age, poids, sexe, lat_norm, niv_norm, one_rm,
-                hip_ext_G, hip_ext_D, knee_flex_G, knee_flex_D, knee_ext_G, knee_ext_D
-            )
-            st.subheader("Option unique (compatibilité)")
-            st.success(f"%RM recommandé : **{pct_rm:.1f}%**  |  Séries/semaine : **{series_sem:.1f}**  |  Score équilibre : {score:.2f}")
-            st.markdown("**Gains estimés sur 6 semaines (%)**")
-            for m, g in zip(MUSCLES, gains):
-                st.write(f"- **{m}** : {g:.2f} %")
-            st.caption("Mode compatibilité : une seule proposition (ancienne API).")
-
-        else:
-            st.error("Aucune fonction de recommandation détectée dans `modele.py` (ni 2 plans, ni 1 plan). Vérifie les noms des fonctions.")
-
-# ---------------------------------------------------------
-# Fin
-# ---------------------------------------------------------
+st.markdown("---")
+st.caption("Les données affichées proviennent des modèles entraînés sur la cohorte 1. Les recommandations sont des aides à la décision et doivent être interprétées par le praticien.")
