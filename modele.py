@@ -9,18 +9,15 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.linear_model import RidgeCV
 from sklearn.ensemble import RandomForestRegressor
 
-DATA_DIR = "data"
-ANON_DIR = os.path.join(DATA_DIR, "anonymes")
-
+# -------------------- chemins et constantes --------------------
 def csv_path(name: str) -> str:
-    DATA_DIRS = ["data", "Data"]
-    for base in DATA_DIRS:
+    for base in ["data", "Data"]:
         p = os.path.join(base, "anonymes", name)
         if os.path.exists(p): return p
-    for base in DATA_DIRS:
+    for base in ["data", "Data"]:
         p = os.path.join(base, name)
         if os.path.exists(p): return p
-    return os.path.join(DATA_DIRS[0], name)
+    return os.path.join("data", name)
 
 CSV_INFOS = csv_path("information initiales.csv")
 CSV_J0    = csv_path("Mesures J0.csv")
@@ -31,7 +28,7 @@ MUSCLES = ["Ext hanche D","Ext hanche G","Flx genou D","Flx genou G","Ext genou 
 TEST_SUBJECTS_DEFAULT = ['Alexia','Romain','Elise']
 CSV_SORTIE_RECO = "recommandations.csv"
 
-# Hyperparamètres décisionnels (plus stricts)
+# -------------------- hyperparamètres décisionnels --------------------
 LAMBDA_EQ        = 0.35
 LAMBDA_EQ_AUTO   = True
 LAMBDA_GRID      = np.linspace(0.20, 0.60, 9)
@@ -40,17 +37,20 @@ COVERAGE_TARGET  = 0.70
 
 TAU_STD          = 10.0
 TAU_STD_DYNAMIC  = True
-TAU_STD_Q        = 0.30     # plus strict qu’avant
-TAU_STD_MAX      = 12.0     # abaissé
+TAU_STD_Q        = 0.30
+TAU_STD_MAX      = 12.0
 TAU_STD_MIN      = 8.0
 
-DIVERGENCE_MIN   = 5.0      # distance L1 min (%RM + Séries)
-GAIN_DIST_MIN    = 16.0     # distance euclidienne min sur gains (6 muscles)
-RELAX_PARAM_STEPS = [4.0, 3.0, 2.0, 1.0, 0.0]
-RELAX_GAIN_STEPS  = [14.0, 12.0, 10.0, 8.0, 5.0, 0.0]
+# diversité renforcée (sans zonage d’intensité)
+DIVERGENCE_MIN   = 6.0     # |Δ%RM| + |ΔSéries|
+GAIN_DIST_MIN    = 20.0    # distance euclidienne sur les 6 gains
+RELAX_PARAM_STEPS = [5.0, 4.0, 3.0, 2.0, 1.0, 0.0]
+RELAX_GAIN_STEPS  = [16.0, 14.0, 12.0, 10.0, 8.0, 0.0]
+TOPK_QUANTILE     = 0.80   # top 20% des meilleurs moyens
 
 LAMBDA_EQ_EFFECTIVE = LAMBDA_EQ
 
+# -------------------- utilitaires --------------------
 def _strip_accents(s: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
@@ -64,6 +64,16 @@ def canon_niveau_keep_tres_avance(niv: str) -> str:
     if s in {'avance','avancee','avancé'}: return 'avancé'
     return 'intermédiaire'
 
+def normalize_df(df):
+    df.columns = [str(c).strip() for c in df.columns]
+    if 'Sujets' not in df.columns:
+        df.rename(columns={df.columns[0]: 'Sujets'}, inplace=True)
+    df['Sujets'] = df['Sujets'].astype(str).str.strip()
+    df = df[df['Sujets'].notna() & (df['Sujets'] != "")]
+    df = df.drop_duplicates(subset=['Sujets'], keep='first')
+    return df
+
+# -------------------- lecture --------------------
 info  = pd.read_csv(CSV_INFOS, sep=';', decimal=',', encoding='latin1')
 j0    = pd.read_csv(CSV_J0,    sep=';', decimal=',', encoding='latin1')
 j6    = pd.read_csv(CSV_J6,    sep=';', decimal=',', encoding='latin1')
@@ -74,15 +84,6 @@ print(f"Information initiales : {info.shape}")
 print(f"Mesures J0 : {j0.shape}")
 print(f"Mesures J+6 semaines : {j6.shape}")
 print(f"Interventions : {interv.shape}")
-
-def normalize_df(df):
-    df.columns = [str(c).strip() for c in df.columns]
-    if 'Sujets' not in df.columns:
-        df.rename(columns={df.columns[0]: 'Sujets'}, inplace=True)
-    df['Sujets'] = df['Sujets'].astype(str).str.strip()
-    df = df[df['Sujets'].notna() & (df['Sujets'] != "")]
-    df = df.drop_duplicates(subset=['Sujets'], keep='first')
-    return df
 
 info   = normalize_df(info)
 j0     = normalize_df(j0)
@@ -98,10 +99,12 @@ print("Effectifs (info, j0, j6, interv) :", len(info), len(j0), len(j6), len(int
 if 'niveau' in info.columns:
     print("Valeurs uniques de 'niveau' :", sorted(info['niveau'].unique()))
 
+# correspondance sujets
 set_info = set(info['Sujets']); set_j0 = set(j0['Sujets']); set_j6 = set(j6['Sujets']); set_int = set(interv['Sujets'])
 print("Sujets manquants dans Interventions :", sorted(set_info - set_int))
 print("Sujets en trop dans Interventions   :", sorted(set_int - set_info))
 
+# -------------------- test subjects robustes --------------------
 all_ids = sorted(set(info['Sujets'].astype(str).str.strip()))
 DEFAULT_TEST = [f"Sujet{i}" for i in range(1, 50)]
 TEST_SUBJECTS = [x for x in TEST_SUBJECTS_DEFAULT if x in all_ids]
@@ -112,6 +115,7 @@ if not TEST_SUBJECTS:
     TEST_SUBJECTS = all_ids[:min(3, len(all_ids))]
 print("TEST utilisé :", TEST_SUBJECTS)
 
+# -------------------- fusion & features --------------------
 for m in MUSCLES:
     if m in j0.columns: j0[m] = pd.to_numeric(j0[m], errors='coerce')
     if m in j6.columns: j6[m] = pd.to_numeric(j6[m], errors='coerce')
@@ -129,12 +133,11 @@ def rm_to_numeric(v):
         if v == '60-75': return 67.5
         if v == '75-85': return 80.0
         if v == '80-90': return 85.0
-    try:
-        return float(v)
-    except:
-        return np.nan
+    try: return float(v)
+    except: return np.nan
 data['%RM_num'] = data['%RM'].apply(rm_to_numeric)
 
+# -------------------- calibration TAU_STD --------------------
 if TAU_STD_DYNAMIC:
     gains = data[[f"Gain_{m}_%" for m in MUSCLES]].copy().dropna()
     if len(gains) > 0:
@@ -153,6 +156,7 @@ if TAU_STD_DYNAMIC:
 else:
     print(f"\n[INFO] TAU_STD fixé = {TAU_STD:.1f}")
 
+# -------------------- préparation ML --------------------
 Y_cols = [f"Gain_{m}_%" for m in MUSCLES]
 info_cols = [c for c in info.columns if c != 'Sujets']
 j0_cols = [f"{m}_J0" for m in MUSCLES if f"{m}_J0" in data.columns]
@@ -168,6 +172,7 @@ prep = ColumnTransformer([
     ('cat', OneHotEncoder(handle_unknown='ignore'), cat_cols)
 ])
 
+# -------------------- entraînement --------------------
 loo = LeaveOneOut()
 MODELS, rows = {}, []
 
@@ -204,6 +209,7 @@ perf = pd.DataFrame(rows)
 print("\n=== Performances LOOCV (meilleur modèle par muscle) ===")
 print(perf.to_string(index=False))
 
+# -------------------- split test --------------------
 print("\n=== Split train/test explicite ===")
 train = data[~data['Sujets'].isin(TEST_SUBJECTS)].copy()
 test  = data[ data['Sujets'].isin(TEST_SUBJECTS)].copy()
@@ -224,6 +230,7 @@ for m in MUSCLES:
     else:
         print(f"[TEST] {m}: n=0")
 
+# -------------------- outils d’évaluation --------------------
 def _predict_gains_from_row(row_dict):
     x = pd.DataFrame([row_dict[feat_cols]])
     preds = np.array([MODELS[m].predict(x)[0] for m in MUSCLES])
@@ -239,6 +246,7 @@ def _evaluate_grid_for_row(row, rm_values, series_values):
             out.append((rm, s, mean_gain, std_gain, preds))
     return out
 
+# -------------------- calibration LAMBDA_EQ --------------------
 if LAMBDA_EQ_AUTO:
     print("\n[INFO] Calibration automatique de LAMBDA_EQ")
     rm_values = np.linspace(40, 90, 11); series_values = np.linspace(4, 12, 9)
@@ -280,6 +288,7 @@ else:
     LAMBDA_EQ_EFFECTIVE = LAMBDA_EQ
     print(f"\n[INFO] LAMBDA_EQ = {LAMBDA_EQ_EFFECTIVE:.2f}")
 
+# -------------------- démo plan unique --------------------
 print("\n>>> Patient utilisé pour la recommandation : (échantillon aléatoire)")
 patient_row = data.sample(1).iloc[0]
 print({k: patient_row[k] for k in list(data.columns)[:8]}, "...")
@@ -296,59 +305,83 @@ def recommander(patient_row):
                 best = {'score':score,'rm':rm,'ser':s,'preds':preds,'mean':mean_gain,'std':std_gain}
     return best['rm'], best['ser'], best['preds'], best['score']
 
+# -------------------- deux plans sans zonage, top-k + diversité --------------------
 def recommander_deux_plans(patient_row):
-    rm_values = np.linspace(40, 90, 11); series_values = np.linspace(4, 12, 9)
+    rm_all     = np.linspace(40, 90, 11)
+    series_all = np.linspace(4, 12, 9)
+
+    # plan équilibré
     best_eq = {'score': -1e9}
-    for rm in rm_values:
-        for s in series_values:
-            row = patient_row.copy(); row['%RM_num'] = rm; row['Séries/semaine'] = s
+    for rm in rm_all:
+        for s in series_all:
+            row = patient_row.copy()
+            row['%RM_num'] = rm
+            row['Séries/semaine'] = s
             preds, mean_gain, std_gain = _predict_gains_from_row(row)
             score_eq = mean_gain - LAMBDA_EQ_EFFECTIVE * std_gain
             if score_eq > best_eq['score']:
-                best_eq = {'score':score_eq,'rm':rm,'ser':s,'preds':preds,'mean':mean_gain,'std':std_gain}
+                best_eq = {
+                    'score': score_eq, 'rm': rm, 'ser': s,
+                    'preds': preds, 'mean': mean_gain, 'std': std_gain
+                }
 
-    def _param_dist(rm, s, ref): return abs(rm - ref['rm']) + abs(s - ref['ser'])
-    def _gain_dist(preds, ref):   return float(np.linalg.norm(preds - ref['preds']))
-
+    # candidats performance (std <= tau)
     candidates = []
-    for rm in rm_values:
-        for s in series_values:
-            row = patient_row.copy(); row['%RM_num'] = rm; row['Séries/semaine'] = s
+    for rm in rm_all:
+        for s in series_all:
+            row = patient_row.copy()
+            row['%RM_num'] = rm
+            row['Séries/semaine'] = s
             preds, mean_gain, std_gain = _predict_gains_from_row(row)
-            candidates.append((rm, s, mean_gain, std_gain, preds))
-    feasible = [(rm, s, m, sd, p) for (rm, s, m, sd, p) in candidates if sd <= TAU_STD]
+            if std_gain <= TAU_STD:
+                candidates.append((rm, s, mean_gain, std_gain, preds))
 
-    perf_strict = []
-    for rm, s, m, sd, p in feasible:
-        if _param_dist(rm, s, best_eq) >= DIVERGENCE_MIN and _gain_dist(p, best_eq) >= GAIN_DIST_MIN:
-            perf_strict.append((rm, s, m, sd, p))
-    if perf_strict:
-        rm, s, m, sd, p = max(perf_strict, key=lambda t: t[2])
-        return best_eq, {'score':m,'rm':rm,'ser':s,'preds':p,'mean':m,'std':sd}
+    if not candidates:
+        best_perf = {
+            'score': -1e9, 'rm': np.nan, 'ser': np.nan,
+            'preds': np.array([np.nan]*len(MUSCLES)), 'mean': np.nan, 'std': np.nan
+        }
+        return best_eq, best_perf
 
-    for relax_param in RELAX_PARAM_STEPS:
-        perf_relax_param = []
-        for rm, s, m, sd, p in feasible:
-            if _param_dist(rm, s, best_eq) >= relax_param and _gain_dist(p, best_eq) >= GAIN_DIST_MIN:
-                perf_relax_param.append((rm, s, m, sd, p))
-        if perf_relax_param:
-            rm, s, m, sd, p = max(perf_relax_param, key=lambda t: t[2])
-            return best_eq, {'score':m,'rm':rm,'ser':s,'preds':p,'mean':m,'std':sd}
+    # top-K en gain moyen
+    means = np.array([c[2] for c in candidates])
+    thr = np.quantile(means, TOPK_QUANTILE)
+    topk = [c for c in candidates if c[2] >= thr]
 
-        for relax_gain in RELAX_GAIN_STEPS:
-            perf_relax_both = []
-            for rm, s, m, sd, p in feasible:
-                if _param_dist(rm, s, best_eq) >= relax_param and _gain_dist(p, best_eq) >= relax_gain:
-                    perf_relax_both.append((rm, s, m, sd, p))
-            if perf_relax_both:
-                rm, s, m, sd, p = max(perf_relax_both, key=lambda t: t[2])
-                return best_eq, {'score':m,'rm':rm,'ser':s,'preds':p,'mean':m,'std':sd}
+    # diversité stricte
+    def _param_dist(c):  # L1 sur paramètres
+        return abs(c[0] - best_eq['rm']) + abs(c[1] - best_eq['ser'])
+    def _gain_dist(c):   # euclidienne sur gains
+        return float(np.linalg.norm(c[4] - best_eq['preds']))
 
-    if feasible:
-        rm, s, m, sd, p = max(feasible, key=lambda t: t[2])
-        return best_eq, {'score':m,'rm':rm,'ser':s,'preds':p,'mean':m,'std':sd}
+    strict = [c for c in topk if _param_dist(c) >= DIVERGENCE_MIN and _gain_dist(c) >= GAIN_DIST_MIN]
+    if strict:
+        strict.sort(key=lambda c: (_gain_dist(c), c[2]), reverse=True)
+        rm, s, m, sd, p = strict[0]
+        best_perf = {'score': m, 'rm': rm, 'ser': s, 'preds': p, 'mean': m, 'std': sd}
+        return best_eq, best_perf
 
-    return best_eq, {'score': -1e9,'rm': np.nan,'ser': np.nan,'preds': np.array([np.nan]*len(MUSCLES)),'mean': np.nan,'std': np.nan}
+    # fallback progressif
+    feasible = topk
+    for relax_p in RELAX_PARAM_STEPS:
+        cand_p = [c for c in feasible if _param_dist(c) >= relax_p and _gain_dist(c) >= GAIN_DIST_MIN]
+        if cand_p:
+            cand_p.sort(key=lambda c: (_gain_dist(c), c[2]), reverse=True)
+            rm, s, m, sd, p = cand_p[0]
+            best_perf = {'score': m, 'rm': rm, 'ser': s, 'preds': p, 'mean': m, 'std': sd}
+            return best_eq, best_perf
+        for relax_g in RELAX_GAIN_STEPS:
+            cand_both = [c for c in feasible if _param_dist(c) >= relax_p and _gain_dist(c) >= relax_g]
+            if cand_both:
+                cand_both.sort(key=lambda c: (_gain_dist(c), c[2]), reverse=True)
+                rm, s, m, sd, p = cand_both[0]
+                best_perf = {'score': m, 'rm': rm, 'ser': s, 'preds': p, 'mean': m, 'std': sd}
+                return best_eq, best_perf
+
+    # dernier recours : meilleur mean dans top-K
+    rm, s, m, sd, p = max(feasible, key=lambda c: c[2])
+    best_perf = {'score': m, 'rm': rm, 'ser': s, 'preds': p, 'mean': m, 'std': sd}
+    return best_eq, best_perf
 
 def _afficher_plan(titre, plan):
     print(titre)
@@ -356,19 +389,20 @@ def _afficher_plan(titre, plan):
         print("  Aucun plan disponible."); return
     print(f"  %RM: {plan['rm']:.1f} | Séries/sem: {plan['ser']:.1f}")
     print(f"  Gain moyen: {plan['mean']:.2f}% | Déséquilibre (écart-type): {plan['std']:.2f}")
-    for m, g in zip(MUSCLES, plan['preds']):
-        print(f"    - {m}: {g:.2f}%")
+    for m, g in zip(MUSCLES, plan['preds']): print(f"    - {m}: {g:.2f}%")
     print(f"  Score: {plan['score']:.2f}")
 
+# -------------------- démo plan unique --------------------
 print("\n>>> Patient utilisé pour la recommandation (démo plan unique)")
 opt_rm, opt_ser, opt_preds, opt_score = recommander(patient_row)
 print("=== Recommandation OPTIMALE & ÉQUILIBRÉE (plan unique) ===")
 print(f"%RM recommandé : {opt_rm:.1f}")
 print(f"Séries/semaine recommandé : {opt_ser:.1f}")
-print("Gains prédits par muscle (%):")
+print("Gains prédits (%):")
 for m, g in zip(MUSCLES, opt_preds): print(f"  - {m}: {g:.2f}")
 print(f"Score global (moy - écart-type) : {opt_score:.2f}")
 
+# -------------------- I/O console & CSV --------------------
 def _safe_input(prompt, default=None, dtype=str):
     s = input(prompt).strip()
     if s == "": return default
@@ -376,7 +410,8 @@ def _safe_input(prompt, default=None, dtype=str):
         s = s.replace(",", ".")
         try:
             x = float(s); return int(x) if dtype is int else x
-        except: print("  Entrée non valide, valeur par défaut conservée."); return default
+        except:
+            print("  Entrée non valide, valeur par défaut conservée."); return default
     return s
 
 def _mode_or_first(series):
@@ -437,6 +472,7 @@ def sauvegarder_plan(path_csv, sujet, plan, etiquette):
     else:
         df_out.to_csv(path_csv, sep=';', decimal=',', index=False, encoding='latin1')
 
+# -------------------- mode interactif --------------------
 if __name__ == "__main__":
     while True:
         choice = input("\nSaisir un NOUVEAU patient ? (o=1 plan / 2=deux plans / n=non) : ").strip().lower()
@@ -453,8 +489,8 @@ if __name__ == "__main__":
                 param_dist = abs(best_perf['rm'] - best_eq['rm']) + abs(best_perf['ser'] - best_eq['ser'])
                 gain_dist  = float(np.linalg.norm(best_perf['preds'] - best_eq['preds']))
                 print(f"--- Diversité ---")
-                print(f"Δ paramètres (|Δ%RM|+|ΔSéries|): {param_dist:.2f} ≥ {DIVERGENCE_MIN}")
-                print(f"Δ résultats (euclidienne gains): {gain_dist:.2f} ≥ {GAIN_DIST_MIN}")
+                print(f"Δ paramètres: {param_dist:.2f} ≥ {DIVERGENCE_MIN}")
+                print(f"Δ résultats: {gain_dist:.2f} ≥ {GAIN_DIST_MIN}")
             sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], best_eq, "Equilibre")
             sauvegarder_plan(CSV_SORTIE_RECO, patient_new['Sujets'], best_perf, "Performance_contrainte")
             print(f"✔ Deux propositions enregistrées dans '{CSV_SORTIE_RECO}'")
@@ -472,6 +508,7 @@ if __name__ == "__main__":
             sauvegarder_recommandation(CSV_SORTIE_RECO, patient_new['Sujets'], opt_rm2, opt_ser2, opt_preds2, opt_score2)
             print(f"✔ Recommandation enregistrée dans '{CSV_SORTIE_RECO}'")
 
+# -------------------- API Streamlit --------------------
 def reco_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
                        hip_ext_G, hip_ext_D, knee_flex_G, knee_flex_D, knee_ext_G, knee_ext_D):
     row = {'Sujets': 'API_patient','âge': age,'sexe': sexe,'poids': poids,
