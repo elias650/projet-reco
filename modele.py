@@ -1,6 +1,6 @@
 # ==========================================================
 # MODELE D'APPRENTISSAGE AUTOMATISÉ — RECO D'INTERVENTION
-# Cohorte 1 — Elias Simon — Version stable
+# Cohorte 1 — Version: lambda auto avec borne minimale
 # ==========================================================
 
 import os
@@ -15,9 +15,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.linear_model import RidgeCV
 from sklearn.ensemble import RandomForestRegressor
 
-# ----------------------------------------------------------
-# Localisation des données (compat data/ ou Data/)
-# ----------------------------------------------------------
+# -------------------- Localisation des données --------------------
 DATA_DIRS = ["data", "Data"]
 ANON_SUB = "anonymes"
 
@@ -40,9 +38,7 @@ CSV_INT   = csv_path("Interventions.csv")
 MUSCLES = ["Ext hanche D","Ext hanche G","Flx genou D","Flx genou G","Ext genou D","Ext genou G"]
 CSV_SORTIE_RECO = "recommandations.csv"
 
-# ----------------------------------------------------------
-# Lecture CSV
-# ----------------------------------------------------------
+# -------------------- Lecture CSV --------------------
 info   = pd.read_csv(CSV_INFOS, sep=';', decimal=',', encoding='latin1')
 j0     = pd.read_csv(CSV_J0,    sep=';', decimal=',', encoding='latin1')
 j6     = pd.read_csv(CSV_J6,    sep=';', decimal=',', encoding='latin1')
@@ -54,9 +50,7 @@ print(f"Mesures J0 : {j0.shape}")
 print(f"Mesures J+6 semaines : {j6.shape}")
 print(f"Interventions : {interv.shape}")
 
-# ----------------------------------------------------------
-# Normalisation tables
-# ----------------------------------------------------------
+# -------------------- Normalisation tables --------------------
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -65,7 +59,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df['Sujets'] = df['Sujets'].astype(str).str.strip()
     df = df[df['Sujets'].notna() & (df['Sujets'] != "")]
     df = df.drop_duplicates(subset=['Sujets'], keep='first')
-    # Normalisation du niveau (accents/espaces)
     if 'niveau' in df.columns:
         df['niveau'] = (df['niveau'].astype(str)
                         .str.lower()
@@ -83,13 +76,12 @@ interv.rename(columns={'Séries/sem':'Séries/semaine','Séries/semai':'Séries/
 
 print("\n--- Après normalisation ---")
 print("Colonnes Interventions :", list(interv.columns))
-print("Valeurs uniques de 'niveau' (après normalisation) :", sorted(info['niveau'].dropna().unique()))
+if 'niveau' in info.columns:
+    print("Valeurs uniques de 'niveau' :", sorted(info['niveau'].dropna().unique()))
 print("Sujets manquants dans Interventions :", sorted(set(info['Sujets']) - set(interv['Sujets'])))
 print("Sujets en trop dans Interventions   :", sorted(set(interv['Sujets']) - set(info['Sujets'])))
 
-# ----------------------------------------------------------
-# Fusion & features
-# ----------------------------------------------------------
+# -------------------- Fusion & features --------------------
 for m in MUSCLES:
     if m in j0.columns: j0[m] = pd.to_numeric(j0[m], errors='coerce')
     if m in j6.columns: j6[m] = pd.to_numeric(j6[m], errors='coerce')
@@ -97,7 +89,6 @@ for m in MUSCLES:
 base = info.merge(j0, on="Sujets").merge(j6, on="Sujets", suffixes=("_J0","_J6"))
 data = base.merge(interv, on="Sujets", how="left")
 
-# Gains %
 for m in MUSCLES:
     data[f"Gain_{m}_%"] = 100 * (data[f"{m}_J6"] - data[f"{m}_J0"]) / data[f"{m}_J0"]
 
@@ -116,12 +107,11 @@ def rm_to_numeric(v):
 if '%RM' in data.columns:
     data['%RM_num'] = data['%RM'].apply(rm_to_numeric)
 
-# Colonnes X / y
-info_cols = [c for c in info.columns if c != 'Sujets']           # âge, sexe, poids, latéralité, niveau, 1RM
-j0_cols   = [f"{m}_J0" for m in MUSCLES if f"{m}_J0" in data.columns]
+info_cols   = [c for c in info.columns if c != 'Sujets']  # âge, sexe, poids, latéralité, niveau, 1RM
+j0_cols     = [f"{m}_J0" for m in MUSCLES if f"{m}_J0" in data.columns]
 interv_cols = [c for c in ['%RM','%RM_num','Séries/semaine'] if c in data.columns]
-feat_cols = info_cols + j0_cols + interv_cols
-Y_cols = [f"Gain_{m}_%" for m in MUSCLES]
+feat_cols   = info_cols + j0_cols + interv_cols
+Y_cols      = [f"Gain_{m}_%" for m in MUSCLES]
 
 num_cols = [c for c in feat_cols if data[c].dtype != 'object']
 cat_cols = [c for c in feat_cols if data[c].dtype == 'object']
@@ -131,9 +121,7 @@ prep = ColumnTransformer([
     ('cat', OneHotEncoder(handle_unknown='ignore'), cat_cols)
 ])
 
-# ----------------------------------------------------------
-# Entraînement : Ridge vs RandomForest (LOOCV)
-# ----------------------------------------------------------
+# -------------------- Entraînement (LOOCV) --------------------
 loo = LeaveOneOut()
 MODELS = {}
 rows = []
@@ -171,12 +159,8 @@ perf = pd.DataFrame(rows)
 print("\n=== Performances LOOCV (meilleur modèle par muscle) ===")
 print(perf.to_string(index=False))
 
-# ----------------------------------------------------------
-# Calibration automatique (TAU_STD et LAMBDA_EQ)
-# ----------------------------------------------------------
-# TAU_STD à partir de la distribution des std chez les plans "performants"
+# -------------------- Calibration TAU_STD (seuil de déséquilibre) --------------------
 def calibrate_tau_std(df: pd.DataFrame) -> float:
-    # Simule std des gains observés (approximation robuste)
     stds = []
     for i in range(len(df)):
         vals = [df[f"Gain_{m}_%"].iloc[i] for m in MUSCLES]
@@ -192,21 +176,20 @@ def calibrate_tau_std(df: pd.DataFrame) -> float:
 TAU_STD = calibrate_tau_std(data)
 print(f"\n[INFO] TAU_STD calibré automatiquement = {TAU_STD:.1f} (bornes 8–14)")
 
-# LAMBDA_EQ : cherche le plus petit lambda assurant une couverture cible
-def calibrate_lambda_eq(df: pd.DataFrame, lambda_grid=None, alpha=0.90, coverage_target=0.70):
+# -------------------- Calibration LAMBDA_EQ (avec borne minimale) --------------------
+LAMBDA_MIN = 0.35  # 👈 borne basse cohérente, évite Équilibre ≈ Performance
+LAMBDA_MAX = 0.70  # borne haute raisonnable
+
+def calibrate_lambda_eq(df: pd.DataFrame, lambda_grid=None, coverage_target=0.70):
     if lambda_grid is None:
         lambda_grid = np.round(np.linspace(0.05, 0.50, 10), 2)
 
     def score_eq(mean, std, lam): return mean - lam*std
 
-    cover_best = 0.0
-    lam_best = lambda_grid[0]
-
-    # évalue, pour chaque lambda, la proportion de sujets qui aurait un score "OK"
-    # (heuristique robuste aux petits n)
+    best = lambda_grid[0]
+    best_cov = 0.0
     for lam in lambda_grid:
-        ok = 0
-        total = 0
+        ok, tot = 0, 0
         for i in range(len(df)):
             vals = [df[f"Gain_{m}_%"].iloc[i] for m in MUSCLES]
             if not all(np.isfinite(vals)):
@@ -214,27 +197,25 @@ def calibrate_lambda_eq(df: pd.DataFrame, lambda_grid=None, alpha=0.90, coverage
             mean_i = float(np.nanmean(vals))
             std_i  = float(np.nanstd(vals))
             sc = score_eq(mean_i, std_i, lam)
-            # on considère "OK" si la pénalisation standard reste compatible avec un niveau de gain minimal (ici >= 0)
             if sc >= 0:
                 ok += 1
-            total += 1
-        if total == 0:
+            tot += 1
+        if tot == 0:
             continue
-        cov = ok/total
+        cov = ok/tot
         if cov >= coverage_target:
-            lam_best = lam
-            cover_best = cov
+            best = lam
+            best_cov = cov
             break
+    return best, best_cov
 
-    print(f"\n[INFO] Calibration automatique de LAMBDA_EQ (objectif clinique)")
-    print(f"  - lambda={lam_best:.2f} -> couverture {cover_best*100:.1f}% (cible {coverage_target*100:.0f}%)")
-    return lam_best
+lam_cal, cov = calibrate_lambda_eq(data, coverage_target=0.70)
+LAMBDA_EQ = float(np.clip(lam_cal, LAMBDA_MIN, LAMBDA_MAX))
 
-LAMBDA_EQ = calibrate_lambda_eq(data, alpha=0.90, coverage_target=0.70)
+print(f"[INFO] LAMBDA_EQ calibré = {lam_cal:.2f} | couverture={cov*100:.1f}% ; "
+      f"après borne min→ LAMBDA_EQ={LAMBDA_EQ:.2f} (min={LAMBDA_MIN}, max={LAMBDA_MAX})")
 
-# ----------------------------------------------------------
-# Outils d’évaluation d’un plan
-# ----------------------------------------------------------
+# -------------------- Prédicteur d’un plan (%RM, séries) --------------------
 def _predict_gains_for(row: pd.Series, rm: float, series: float):
     r = row.copy()
     r['%RM_num'] = float(rm)
@@ -245,12 +226,9 @@ def _predict_gains_for(row: pd.Series, rm: float, series: float):
     std  = float(np.std(preds))
     return preds, mean, std
 
-# ----------------------------------------------------------
-# Optimisation — grilles et règles
-# ----------------------------------------------------------
-# IMPORTANT : séries bornées dès la grille (≥ 6)
-RM_VALUES = np.linspace(40, 90, 11)    # 40,45,...,90
-SERIES_VALUES = np.linspace(6, 12, 7)  # 6,7,...,12  ← borne basse clinique
+# -------------------- Optimisation (grilles et règles) --------------------
+RM_VALUES     = np.linspace(40, 90, 11)   # 40,45,...,90
+SERIES_VALUES = np.linspace(6, 12, 7)     # 6,7,...,12 (borne basse clinique)
 
 def _best_equilibre(row: pd.Series):
     best = None
@@ -276,7 +254,6 @@ def _best_performance(row: pd.Series):
     return {"rm": rm, "series": s, "gains": preds, "mean": mean, "std": std, "score": mean}
 
 def _best_stabilite(row: pd.Series):
-    # minimise l'écart-type (départage par la moyenne)
     best = None
     for rm in RM_VALUES:
         for s in SERIES_VALUES:
@@ -285,17 +262,12 @@ def _best_stabilite(row: pd.Series):
             if (best is None) or (cand[0] < best[0]) or (cand[0] == best[0] and cand[1] > best[1]):
                 best = cand
     std, mean, rm, s, preds = best
-
-    # Sécurité post-optimisation : si jamais < 6 (si la grille est modifiée un jour), on force s=6 et on recalcule
     if s < 6.0:
         s = 6.0
         preds, mean, std = _predict_gains_for(row, rm, s)
-
     return {"rm": rm, "series": s, "gains": preds, "mean": mean, "std": std, "score": -std}
 
-# ----------------------------------------------------------
-# API — Recommandation (1 plan) pour compat Streamlit
-# ----------------------------------------------------------
+# -------------------- API Streamlit — 1 plan --------------------
 def reco_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
                        hip_ext_G, hip_ext_D, knee_flex_G, knee_flex_D, knee_ext_G, knee_ext_D):
     row = {
@@ -310,9 +282,7 @@ def reco_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
     p = _best_equilibre(s)
     return float(p["rm"]), float(p["series"]), [float(x) for x in p["gains"]], float(p["score"])
 
-# ----------------------------------------------------------
-# API — Recommandation (3 plans)
-# ----------------------------------------------------------
+# -------------------- API Streamlit — 3 plans --------------------
 def reco3_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
                         hip_ext_G, hip_ext_D, knee_flex_G, knee_flex_D, knee_ext_G, knee_ext_D):
     row = {
@@ -324,23 +294,20 @@ def reco3_depuis_inputs(age, poids, sexe, lateralite, niveau, one_rm,
         '%RM': '60-75', '%RM_num': 67.5, 'Séries/semaine': 6.0
     }
     s = pd.Series(row)
-    eq  = _best_equilibre(s)
-    pf  = _best_performance(s)
-    st  = _best_stabilite(s)
-    # Coercition finale par sécurité (ne devrait pas être nécessaire avec la grille ≥ 6)
+    eq = _best_equilibre(s)
+    pf = _best_performance(s)
+    st = _best_stabilite(s)
     if st["series"] < 6.0:
         st["series"] = 6.0
         preds, mean, std = _predict_gains_for(s, st["rm"], st["series"])
         st["gains"], st["mean"], st["std"], st["score"] = preds, mean, std, -std
     return {
-        "equilibre": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in eq.items()},
-        "performance": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in pf.items()},
-        "stabilite": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in st.items()},
+        "equilibre":  {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in eq.items()},
+        "performance":{k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in pf.items()},
+        "stabilite":  {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in st.items()},
     }
 
-# ----------------------------------------------------------
-# Mode console interactif (optionnel)
-# ----------------------------------------------------------
+# -------------------- Mode console (optionnel) --------------------
 def _mode_or_first(series):
     vc = series.dropna().astype(str).str.strip().value_counts()
     return vc.index[0] if len(vc) > 0 else None
@@ -413,13 +380,11 @@ if __name__ == "__main__":
     patient_row = data.sample(1).iloc[0]
     print({k: patient_row[k] for k in ['Sujets','âge','sexe','poids','latéralité','niveau','1RM']}, "...")
 
-    # Démo 1 plan (équilibre)
     eq_demo = _best_equilibre(patient_row)
     print("\n=== Recommandation OPTIMALE & ÉQUILIBRÉE (démo) ===")
     print(f"%RM: {eq_demo['rm']:.1f} | Séries/sem: {eq_demo['series']:.1f}")
     print(f"Gain moyen: {eq_demo['mean']:.2f}% | Écart-type: {eq_demo['std']:.2f} | Score: {eq_demo['score']:.2f}")
 
-    # Boucle console optionnelle
     while True:
         choice = input("\nSaisir un NOUVEAU patient ? (o=1 plan / 2=trois plans / n=non) : ").strip().lower()
         if choice not in ('o','oui','y','2'):
@@ -439,7 +404,7 @@ if __name__ == "__main__":
             sauvegarder_recommandation(CSV_SORTIE_RECO, p['Sujets'], "Equilibre", eq)
             sauvegarder_recommandation(CSV_SORTIE_RECO, p['Sujets'], "Performance", pf)
             sauvegarder_recommandation(CSV_SORTIE_RECO, p['Sujets'], "Stabilite", st)
-            print(f"✔ Deux/trois propositions enregistrées dans '{CSV_SORTIE_RECO}'")
+            print(f"✔ Propositions enregistrées dans '{CSV_SORTIE_RECO}'")
         else:
             eq = _best_equilibre(p)
             print("\n=== RECOMMANDATION (ÉQUILIBRE) ===")
